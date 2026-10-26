@@ -127,6 +127,189 @@ describe('K\'sRouter API', () => {
     ]);
   });
 
+  it('adapts Gemini text chat requests and maps usage and finish reasons', async () => {
+    let receivedUrl = '';
+    let receivedHeaders = new Headers();
+    let receivedBody: Record<string, any> = {};
+    const { app, clientKey } = await testApp(async (input, init) => {
+      receivedUrl = String(input);
+      receivedHeaders = new Headers(init?.headers);
+      receivedBody = JSON.parse(String(init?.body));
+      return Response.json({
+        responseId: 'gemini-response-id',
+        modelVersion: 'gemini-2.5-flash',
+        candidates: [{ index: 0, content: { parts: [{ text: 'Hello from Gemini' }] }, finishReason: 'MAX_TOKENS' }],
+        usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 5, totalTokenCount: 17 },
+      });
+    }, { providers: [{
+      name: 'google', type: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      apiKey: 'gemini-private-key', models: ['gemini-2.5-flash'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'gemini-2.5-flash',
+      messages: [
+        { role: 'system', content: 'Be concise.' },
+        { role: 'user', content: 'First turn' },
+        { role: 'assistant', content: 'Prior answer' },
+        { role: 'user', content: 'Continue' },
+      ],
+      temperature: 0.4,
+      top_p: 0.8,
+      max_tokens: 64,
+      stop: ['END'],
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(receivedUrl, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent');
+    assert.equal(receivedHeaders.get('x-goog-api-key'), 'gemini-private-key');
+    assert.equal(receivedHeaders.get('authorization'), null);
+    assert.deepEqual(receivedBody, {
+      systemInstruction: { parts: [{ text: 'Be concise.' }] },
+      contents: [
+        { role: 'user', parts: [{ text: 'First turn' }] },
+        { role: 'model', parts: [{ text: 'Prior answer' }] },
+        { role: 'user', parts: [{ text: 'Continue' }] },
+      ],
+      generationConfig: { temperature: 0.4, topP: 0.8, maxOutputTokens: 64, stopSequences: ['END'] },
+    });
+    assert.deepEqual(response.json().choices[0], {
+      index: 0,
+      message: { role: 'assistant', content: 'Hello from Gemini' },
+      finish_reason: 'length',
+    });
+    assert.equal(response.json().id, 'chatcmpl-gemini-response-id');
+    assert.equal(response.json().model, 'gemini-2.5-flash');
+    assert.deepEqual(response.json().usage, { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 });
+
+    const providers = await app.inject({ method: 'GET', url: '/admin/providers', headers: adminHeaders() });
+    assert.equal(providers.json().providers[0].type, 'gemini');
+    assert.equal(JSON.stringify(providers.json()).includes('gemini-private-key'), false);
+    const models = await app.inject({ method: 'GET', url: '/admin/models', headers: adminHeaders() });
+    assert.deepEqual(models.json().models, [{ model: 'gemini-2.5-flash', provider: 'google' }]);
+  });
+
+  it('translates Gemini SSE chunks into OpenAI chat completion events', async () => {
+    let receivedUrl = '';
+    let receivedHeaders = new Headers();
+    const { app, clientKey } = await testApp(async (input, init) => {
+      receivedUrl = String(input);
+      receivedHeaders = new Headers(init?.headers);
+      const events = [
+        { responseId: 'stream-id', candidates: [{ index: 0, content: { parts: [{ text: 'Hello ' }] } }] },
+        { responseId: 'stream-id', candidates: [{ index: 0, content: { parts: [{ text: 'world' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 } },
+      ].map((event) => 'data: ' + JSON.stringify(event) + '\n\n').join('');
+      return new Response(events, { headers: { 'content-type': 'text/event-stream' } });
+    }, { providers: [{
+      name: 'google', type: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      apiKey: 'gemini-private-key', models: ['gemini-test'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'gemini-test',
+      messages: [{ role: 'user', content: 'Hi' }],
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(receivedUrl, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse');
+    assert.equal(receivedHeaders.get('x-goog-api-key'), 'gemini-private-key');
+    assert.match(response.headers['content-type'] ?? '', /text\/event-stream/);
+    const eventData = response.body.split('\n').filter((line) => line.startsWith('data: ')).map((line) => line.slice(6));
+    const chunks = eventData.filter((line) => line !== '[DONE]').map((line) => JSON.parse(line));
+    assert.equal(chunks[0].choices[0].delta.role, 'assistant');
+    assert.equal(chunks.map((chunk) => chunk.choices[0]?.delta?.content ?? '').join(''), 'Hello world');
+    assert.equal(chunks.find((chunk) => chunk.choices[0]?.finish_reason)?.choices[0].finish_reason, 'stop');
+    assert.deepEqual(chunks.find((chunk) => chunk.choices.length === 0).usage, {
+      prompt_tokens: 4, completion_tokens: 2, total_tokens: 6,
+    });
+    assert.equal(eventData.at(-1), '[DONE]');
+  });
+
+  it('rejects unsupported Gemini request features before calling the provider', async () => {
+    let calls = 0;
+    const { app, clientKey } = await testApp(async () => {
+      calls++;
+      return Response.json({});
+    }, { providers: [{
+      name: 'google', type: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      apiKey: 'gemini-private-key', models: ['gemini-test'],
+    }] });
+    const response = await chat(app, clientKey, {
+      model: 'gemini-test', messages: [{ role: 'user', content: 'Hi' }], tools: [],
+    });
+    assert.equal(response.statusCode, 400);
+    assert.match(response.json().error.message, /does not support OpenAI tools/);
+    assert.equal(calls, 0);
+  });
+
+  it('sanitizes Gemini provider errors and maps safety blocks to content_filter', async () => {
+    let responsePayload: unknown = { error: { message: 'contains gemini-private-key' } };
+    let upstreamStatus = 403;
+    const { app, clientKey } = await testApp(async () => Response.json(responsePayload, { status: upstreamStatus }), {
+      providers: [{
+        name: 'google', type: 'gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        apiKey: 'gemini-private-key', models: ['gemini-test'],
+      }],
+    });
+    const providerError = await chat(app, clientKey, { model: 'gemini-test', messages: [{ role: 'user', content: 'Hi' }] });
+    assert.equal(providerError.statusCode, 502);
+    assert.equal(JSON.stringify(providerError.json()).includes('gemini-private-key'), false);
+
+    responsePayload = {
+      promptFeedback: { blockReason: 'SAFETY' },
+      candidates: [],
+      usageMetadata: { promptTokenCount: 3, totalTokenCount: 3 },
+    };
+    upstreamStatus = 200;
+    const blocked = await chat(app, clientKey, { model: 'gemini-test', messages: [{ role: 'user', content: 'Hi' }] });
+    assert.equal(blocked.statusCode, 200);
+    assert.equal(blocked.json().choices[0].finish_reason, 'content_filter');
+    assert.equal(blocked.json().choices[0].message.content, '');
+    assert.deepEqual(blocked.json().usage, { prompt_tokens: 3, completion_tokens: 0, total_tokens: 3 });
+  });
+
+  it('aborts the Gemini upstream when the client cancels an SSE response', async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    const { app, clientKey } = await testApp(async (_input, init) => {
+      upstreamSignal = init?.signal as AbortSignal;
+      const firstEvent = 'data: ' + JSON.stringify({
+        candidates: [{ index: 0, content: { parts: [{ text: 'first' }] } }],
+      }) + '\n\n';
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode(firstEvent)); },
+      });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    }, { providers: [{
+      name: 'google', type: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      apiKey: 'gemini-private-key', models: ['gemini-test'],
+    }] });
+
+    await app.listen({ host: '127.0.0.1', port: 0 });
+    const address = app.server.address();
+    assert.ok(address && typeof address !== 'string');
+    const controller = new AbortController();
+    const response = await fetch('http://127.0.0.1:' + address.port + '/v1/chat/completions', {
+      method: 'POST', signal: controller.signal,
+      headers: { authorization: 'Bearer ' + clientKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gemini-test', messages: [{ role: 'user', content: 'Hi' }], stream: true }),
+    });
+    const reader = response.body!.getReader();
+    await reader.read();
+    controller.abort();
+    await Promise.race([
+      new Promise<void>((resolve) => upstreamSignal?.addEventListener('abort', () => resolve(), { once: true })),
+      new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error('upstream cancellation timed out')), 1000)),
+    ]);
+    assert.equal(upstreamSignal?.aborted, true);
+    await reader.cancel().catch(() => undefined);
+  });
+
   it('returns model_not_found when no provider owns the requested model', async () => {
     const { app, clientKey } = await testApp(async () => { throw new Error('must not call provider'); });
     const response = await chat(app, clientKey, { model: 'unknown-model', messages: [] });

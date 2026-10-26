@@ -3,9 +3,22 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import { ClientKeyStore } from './client-key-store.js';
+import {
+  type GeminiResponse,
+  GeminiCompatibilityError,
+  geminiEndpoint,
+  readGeminiEventStream,
+  toGeminiRequest,
+  toOpenAiChunk,
+  toOpenAiResponse,
+  toOpenAiUsageChunk,
+} from './gemini-adapter.js';
+
+export type ProviderType = 'openai' | 'gemini';
 
 export interface ProviderConfig {
   name: string;
+  type?: ProviderType;
   baseUrl: string;
   apiKey: string;
   models: string[];
@@ -40,6 +53,7 @@ interface ChatCompletionBody {
 }
 
 interface ProviderUpdateBody {
+  type?: unknown;
   baseUrl?: unknown;
   apiKey?: unknown;
   models?: unknown;
@@ -58,6 +72,7 @@ function errorResponse(message: string, type = 'invalid_request_error') {
 function safeProvider(provider: ProviderConfig) {
   return {
     name: provider.name,
+    type: provider.type ?? 'openai',
     baseUrl: provider.baseUrl,
     models: [...provider.models],
     hasApiKey: Boolean(provider.apiKey),
@@ -83,7 +98,9 @@ function readProviderUpdate(body: ProviderUpdateBody, current?: ProviderConfig):
   if (models.length === 0 || !apiKey) return null;
   if (new Set(models).size !== models.length) return null;
 
-  return { name: current?.name ?? '', baseUrl: body.baseUrl.trim().replace(/\/+$/, ''), apiKey, models };
+  const type = body.type ?? current?.type ?? 'openai';
+  if (type !== 'openai' && type !== 'gemini') return null;
+  return { name: current?.name ?? '', type, baseUrl: body.baseUrl.trim().replace(/\/+$/, ''), apiKey, models };
 }
 
 export function createApp(config: RouterConfig): FastifyInstance {
@@ -148,6 +165,25 @@ export function createApp(config: RouterConfig): FastifyInstance {
       return reply.code(404).send(errorResponse(`No provider is configured for model "${body.model}".`, 'model_not_found'));
     }
 
+    const providerType = provider.type ?? 'openai';
+    let upstreamBody: string;
+    let upstreamUrl: string;
+    try {
+      if (providerType === 'gemini') {
+        upstreamBody = JSON.stringify(toGeminiRequest(body));
+        upstreamUrl = geminiEndpoint(provider.baseUrl, body.model, body.stream === true);
+      } else {
+        upstreamBody = JSON.stringify(body);
+        upstreamUrl = provider.baseUrl.replace(/\/+$/, '') + '/chat/completions';
+      }
+    } catch (error) {
+      const message = error instanceof GeminiCompatibilityError
+        ? error.message
+        : 'The request could not be translated for this provider.';
+      recordRequest({ status: 'error', provider: provider.name, model: body.model, latencyMs: Date.now() - started, httpStatus: 400 });
+      return reply.code(400).send(errorResponse(message));
+    }
+
     const abortController = new AbortController();
     const abortUpstream = () => {
       if (!reply.raw.writableEnded) abortController.abort();
@@ -157,14 +193,16 @@ export function createApp(config: RouterConfig): FastifyInstance {
 
     let upstream: Response;
     try {
-      upstream = await fetchImpl(`${provider.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+      upstream = await fetchImpl(upstreamUrl, {
         method: 'POST',
         headers: {
-          authorization: `Bearer ${provider.apiKey}`,
+          ...(providerType === 'gemini'
+            ? { 'x-goog-api-key': provider.apiKey }
+            : { authorization: `Bearer ${provider.apiKey}` }),
           'content-type': 'application/json',
           accept: body.stream === true ? 'text/event-stream' : 'application/json',
         },
-        body: JSON.stringify(body),
+        body: upstreamBody,
         signal: abortController.signal,
       });
     } catch {
@@ -182,8 +220,18 @@ export function createApp(config: RouterConfig): FastifyInstance {
 
     if (body.stream !== true) {
       const contentType = upstream.headers.get('content-type');
-      if (contentType) reply.header('content-type', contentType);
-      const responseBody = await upstream.text();
+      let responseBody: string | object;
+      if (providerType === 'gemini') {
+        try {
+          responseBody = toOpenAiResponse(await upstream.json(), body.model);
+        } catch {
+          recordRequest({ status: 'error', provider: provider.name, model: body.model, latencyMs: Date.now() - started, httpStatus: 502 });
+          return reply.code(502).send(errorResponse('The upstream provider returned an invalid response.', 'upstream_error'));
+        }
+      } else {
+        if (contentType) reply.header('content-type', contentType);
+        responseBody = await upstream.text();
+      }
       recordRequest({ status: 'success', provider: provider.name, model: body.model, latencyMs: Date.now() - started, httpStatus: upstream.status });
       return reply.code(upstream.status).send(responseBody);
     }
@@ -191,6 +239,66 @@ export function createApp(config: RouterConfig): FastifyInstance {
     if (!upstream.body) {
       recordRequest({ status: 'error', provider: provider.name, model: body.model, latencyMs: Date.now() - started, httpStatus: 502 });
       return reply.code(502).send(errorResponse('The upstream provider returned an empty stream.', 'upstream_error'));
+    }
+
+    if (providerType === 'gemini') {
+      reply.hijack();
+      reply.raw.writeHead(upstream.status, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      const id = 'chatcmpl-' + randomUUID();
+      const created = Math.floor(Date.now() / 1000);
+      const includeUsage = Boolean((body.stream_options as { include_usage?: unknown } | undefined)?.include_usage);
+      let includeRole = true;
+      let lastGeminiResponse: GeminiResponse | undefined;
+      let streamFailed = false;
+      const writeEvent = async (event: unknown) => {
+        if (reply.raw.destroyed) return false;
+        if (reply.raw.write('data: ' + JSON.stringify(event) + '\n\n')) return true;
+        await new Promise<void>((resolveDrain) => {
+          const finish = () => {
+            reply.raw.off('drain', finish);
+            reply.raw.off('close', finish);
+            reply.raw.off('error', finish);
+            resolveDrain();
+          };
+          reply.raw.once('drain', finish);
+          reply.raw.once('close', finish);
+          reply.raw.once('error', finish);
+        });
+        return !reply.raw.destroyed;
+      };
+      try {
+        for await (const chunk of readGeminiEventStream(upstream.body)) {
+          lastGeminiResponse = chunk;
+          if (!await writeEvent(toOpenAiChunk(chunk, body.model, id, created, includeRole))) break;
+          includeRole = false;
+        }
+        if (includeRole) {
+          await writeEvent(toOpenAiChunk({}, body.model, id, created, true));
+          await writeEvent(toOpenAiChunk({ candidates: [{ finishReason: 'STOP' }] }, body.model, id, created, false));
+        }
+        if (includeUsage && lastGeminiResponse) {
+          const usageChunk = toOpenAiUsageChunk(lastGeminiResponse, body.model, id, created);
+          if (usageChunk) await writeEvent(usageChunk);
+        }
+        if (!reply.raw.destroyed) reply.raw.write('data: [DONE]\n\n');
+      } catch {
+        streamFailed = true;
+      } finally {
+        if (!reply.raw.destroyed) reply.raw.end();
+        recordRequest({
+          status: streamFailed ? 'error' : 'success',
+          provider: provider.name,
+          model: body.model,
+          latencyMs: Date.now() - started,
+          httpStatus: streamFailed ? 502 : upstream.status,
+        });
+      }
+      return reply;
     }
 
     reply.hijack();
@@ -326,6 +434,8 @@ function providersFromEnv(): ProviderConfig[] {
   return ids.map((id) => {
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`Invalid provider id: ${id}`);
     const prefix = `PROVIDER_${id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+    const configuredType = process.env[`${prefix}_TYPE`]?.trim().toLowerCase() || 'openai';
+    if (configuredType !== 'openai' && configuredType !== 'gemini') throw new Error(`${prefix}_TYPE must be "openai" or "gemini".`);
     const modelList = requiredEnv(`${prefix}_MODELS`).split(',').map((model) => model.trim()).filter(Boolean);
     if (modelList.length === 0) throw new Error(`${prefix}_MODELS must contain at least one model.`);
     const baseUrl = requiredEnv(`${prefix}_BASE_URL`);
@@ -340,6 +450,7 @@ function providersFromEnv(): ProviderConfig[] {
     }
     return {
       name: id,
+      type: configuredType,
       baseUrl,
       apiKey: requiredEnv(`${prefix}_API_KEY`),
       models: modelList,

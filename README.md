@@ -1,11 +1,11 @@
 # K'sRouter
 
-K'sRouter is an independent, self-hosted, multi-provider AI gateway built with TypeScript, Node.js, Fastify, React, Vite, and Tailwind CSS. It routes OpenAI-compatible chat completions by model name and includes a private web dashboard.
+K'sRouter is an independent, self-hosted, multi-provider AI gateway built with TypeScript, Node.js, Fastify, React, Vite, and Tailwind CSS. It routes OpenAI-compatible chat completions by model name to OpenAI-compatible upstreams or the native Google Gemini API, and includes a private web dashboard.
 
 ## Requirements
 
 - Node.js 20.6 or newer
-- An OpenAI-compatible provider endpoint and API key
+- An OpenAI-compatible provider or Google Gemini API key
 
 ## Configure
 
@@ -27,6 +27,23 @@ PROVIDER_GROQ_MODELS=llama-3.3-70b-versatile
 ```
 
 Each model must be assigned to one provider only. Provider configuration from the dashboard is held in memory and resets on restart; environment configuration is loaded at startup.
+
+### Google Gemini API
+
+Set a provider type to gemini; the public client API remains /v1/chat/completions. The base URL is the Gemini API root. Provider keys stay server-side and are sent in the x-goog-api-key header.
+
+```env
+PROVIDER_IDS=openai,gemini
+PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1
+PROVIDER_OPENAI_API_KEY=your-openai-key
+PROVIDER_OPENAI_MODELS=gpt-4o-mini
+PROVIDER_GEMINI_TYPE=gemini
+PROVIDER_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+PROVIDER_GEMINI_API_KEY=your-gemini-api-key
+PROVIDER_GEMINI_MODELS=gemini-2.5-flash
+```
+
+PROVIDER_ID_TYPE (with ID replaced by the provider ID) is optional and defaults to openai; accepted values are openai and gemini. The dashboard provider form has the same type selector. Use the exact Gemini model name accepted by the API/account.
 
 ## Run locally
 
@@ -65,6 +82,12 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 ```
 
 The dashboard can list, add, edit, and remove providers; manage client keys; list model routes; view request metadata; and inspect runtime settings. Provider API keys are accepted by the server but never returned to the dashboard. Provider dashboard changes are in-memory only. Request logs retain up to 100 recent entries by default and contain only status, provider, model, timestamp, and latency—not message contents or credentials.
+
+## Gemini compatibility
+
+The Gemini adapter translates OpenAI chat messages (system, developer, user, and assistant) to Gemini systemInstruction and contents, and maps temperature, top_p, top_k, max_tokens / max_completion_tokens, stop, presence_penalty, frequency_penalty, and seed to Gemini generation configuration. It maps the first Gemini candidate to one OpenAI choice, maps STOP, MAX_TOKENS, and safety-related finish reasons to stop, length, and content_filter, and translates prompt/candidate/total token counts when supplied. Streaming uses Gemini streamGenerateContent SSE and emits OpenAI chat completion chunks; a usage chunk is included when the client requests stream_options.include_usage.
+
+This initial adapter supports text-only conversations and one completion choice. It rejects OpenAI tool/function calling, non-text message parts (including image/audio/video), response_format, logprobs, and logit_bias; it does not translate multimodal output, tool calls, multiple Gemini candidates, Gemini safety ratings, citations, or other Gemini-specific metadata. Gemini thinking-only parts are omitted from assistant text. Gemini-specific generation settings with no OpenAI request equivalent are not configurable through this adapter. Provider HTTP and malformed-payload errors are returned as sanitized gateway errors. A mid-stream Gemini error closes the stream and is recorded as a failed request; an OpenAI-style in-band error event is not synthesized.
 
 Run the production build and automated tests with:
 
