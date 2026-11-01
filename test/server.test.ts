@@ -344,6 +344,60 @@ describe('K\'sRouter API', () => {
     assert.equal(response.json().error.message, 'The upstream provider returned HTTP 503.');
   });
 
+  it('redacts credentials and private upstream error bodies on HTTP failures', async () => {
+    const providerSecret = 'upstream-provider-private-secret';
+    const privatePrompt = 'do-not-expose-private-prompt';
+    const { app, clientKey } = await testApp(async () => Response.json({
+      error: { message: `provider failure: ${providerSecret}; prompt: ${privatePrompt}` },
+    }, { status: 429 }), { providers: [{
+      name: 'private-provider', baseUrl: 'https://provider.test/v1',
+      apiKey: providerSecret, models: ['redaction-model'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'redaction-model', messages: [{ role: 'user', content: privatePrompt }],
+    });
+    assert.equal(response.statusCode, 502);
+    assert.deepEqual(response.json(), {
+      error: { message: 'The upstream provider returned HTTP 429.', type: 'upstream_error' },
+    });
+
+    const logs = await app.inject({ method: 'GET', url: '/admin/requests', headers: adminHeaders() });
+    assert.equal(logs.statusCode, 200);
+    assert.equal(logs.json().requests[0].httpStatus, 502);
+    const serialized = response.body + JSON.stringify(logs.json());
+    for (const secret of [providerSecret, clientKey, privatePrompt]) {
+      assert.equal(serialized.includes(secret), false, 'upstream failure must not expose private data');
+    }
+  });
+
+  it('redacts thrown upstream network errors instead of returning exception details', async () => {
+    const providerSecret = 'network-provider-private-secret';
+    const privatePrompt = 'private-network-test-prompt';
+    const { app, clientKey } = await testApp(async () => {
+      throw new Error(`Network error contained ${providerSecret} and ${privatePrompt}`);
+    }, { providers: [{
+      name: 'network-provider', baseUrl: 'https://provider.test/v1',
+      apiKey: providerSecret, models: ['network-model'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'network-model', messages: [{ role: 'user', content: privatePrompt }],
+    });
+    assert.equal(response.statusCode, 502);
+    assert.deepEqual(response.json(), {
+      error: { message: 'The upstream provider could not be reached.', type: 'upstream_error' },
+    });
+
+    const logs = await app.inject({ method: 'GET', url: '/admin/requests', headers: adminHeaders() });
+    assert.equal(logs.statusCode, 200);
+    assert.equal(logs.json().requests[0].status, 'error');
+    const serialized = response.body + JSON.stringify(logs.json());
+    for (const secret of [providerSecret, clientKey, privatePrompt]) {
+      assert.equal(serialized.includes(secret), false, 'network failure must not expose private data');
+    }
+  });
+
   it('requires admin authentication separately from client authentication', async () => {
     const { app, clientKey } = await testApp(async () => Response.json({}));
     for (const url of ['/admin/overview', '/admin/providers', '/admin/models', '/admin/requests', '/admin/settings', '/admin/client-keys']) {
