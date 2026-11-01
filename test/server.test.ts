@@ -330,6 +330,43 @@ describe('K\'sRouter API', () => {
     assert.equal(response.body, eventStream);
   });
 
+  it('returns a sanitized error when an upstream SSE response has no body', async () => {
+    const { app, clientKey } = await testApp(async () =>
+      new Response(null, { status: 200, headers: { 'content-type': 'text/event-stream' } }));
+    const response = await chat(app, clientKey, { model: 'demo-model', messages: [], stream: true });
+    assert.equal(response.statusCode, 502);
+    assert.deepEqual(response.json(), {
+      error: { message: 'The upstream provider returned an empty stream.', type: 'upstream_error' },
+    });
+    const logs = await app.inject({ method: 'GET', url: '/admin/requests', headers: adminHeaders() });
+    assert.equal(logs.json().requests[0].status, 'error');
+    assert.equal(logs.json().requests[0].httpStatus, 502);
+  });
+
+  it('records a failed OpenAI-compatible stream as error when upstream reading throws', async () => {
+    const privateMessage = 'upstream-failure-private-marker';
+    let reads = 0;
+    const { app, clientKey } = await testApp(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (reads++ === 0) {
+            controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\\n\\n'.replaceAll('\\n', '\n')));
+          } else {
+            controller.error(new Error(privateMessage));
+          }
+        },
+      });
+      return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+    });
+    const response = await chat(app, clientKey, { model: 'demo-model', messages: [], stream: true });
+    assert.equal(response.statusCode, 200, 'headers may already be sent before an upstream failure');
+    assert.equal(response.body.includes(privateMessage), false);
+    const logs = await app.inject({ method: 'GET', url: '/admin/requests', headers: adminHeaders() });
+    assert.equal(logs.json().requests[0].status, 'error');
+    assert.equal(logs.json().requests[0].httpStatus, 502);
+    assert.equal(JSON.stringify(logs.json()).includes(privateMessage), false);
+  });
+
   it('rejects malformed authenticated request bodies', async () => {
     const { app, clientKey } = await testApp(async () => { throw new Error('must not call provider'); });
     const response = await chat(app, clientKey, { model: 4 });
