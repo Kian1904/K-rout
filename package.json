@@ -1,6 +1,6 @@
 {
   "name": "k-srouter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,7 +13,7 @@
     "benchmark": "npm run build && node --expose-gc scripts/benchmark.mjs"
   },
   "dependencies": {
-    "@fastify/static": "^10.1.6",
+    "@fastify/static": "^10.1.8",
     "fastify": "^5.2.1",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
@@ -31,8 +31,8 @@
     "typescript": "^5.7.3",
     "vite": "^6.2.0"
   },
-  "allowScripts": {
-    "esbuild@0.28.2": true,
-    "esbuild@0.25.12": true
+  "overrides": {
+    "glob": "^14.0.2",
+    "minimatch": "^11.0.1"
   }
 }

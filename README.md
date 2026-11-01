@@ -26,7 +26,17 @@ PROVIDER_GROQ_API_KEY=your-groq-key
 PROVIDER_GROQ_MODELS=llama-3.3-70b-versatile
 ```
 
-Each model must be assigned to one provider only. Provider configuration from the dashboard is held in memory and resets on restart; environment configuration is loaded at startup.
+Each model must be assigned to one provider only. Existing installations can continue to configure providers entirely through environment variables.
+
+### Provider configuration persistence
+
+The gateway stores dashboard provider changes in a local JSON file. Set `PROVIDER_CONFIG_PATH` to change the location; the default is `.data/providers.json` relative to the working directory. The first successful dashboard create, edit, or delete writes the complete active provider registry, including providers originally loaded from environment variables. Writes use a same-directory temporary file followed by an atomic rename. On POSIX systems the directory is set to `0700` and the file to `0600`.
+
+Precedence is intentional: while the JSON file does not exist, the gateway loads the existing `PROVIDER_*` environment variables as before. Once the file exists, that saved registry is authoritative and all provider environment entries are ignored at startup. This means dashboard edits and deletions survive restarts, including deletion of a provider originally supplied by the environment. To return to environment-only configuration, stop the gateway and remove or move the saved JSON file; the next start will load the environment registry. Keep `PROVIDER_CONFIG_PATH` in the server environment, never in browser settings.
+
+The file contains provider API keys in plaintext. Filesystem permissions protect against other local users on a correctly configured POSIX filesystem, but they do not encrypt secrets or protect against another process running as the same OS user, root access, malware, or insecure backups. In Termux, keep the file under Termux's private home directory rather than shared Android storage, where POSIX permission behavior may differ. K'sRouter does not create automatic backups. Stop the gateway before copying the file for a consistent backup, store the copy with equivalent access controls, and treat every backup as a provider credential. Restore a backup by stopping the gateway and placing it at the configured path.
+
+If the file exists but is unreadable, malformed, or has an unsupported schema, startup fails and leaves it untouched rather than silently falling back to environment values or overwriting it. Restore a known-good backup or repair the file while the gateway is stopped.
 
 ### Google Gemini API
 
@@ -94,6 +104,7 @@ Run the production build and automated tests with:
 ```sh
 npm run build
 npm test
+npm audit
 ```
 
 ## Performance baseline (local mock)

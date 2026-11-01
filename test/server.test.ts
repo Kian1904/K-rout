@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
@@ -10,7 +10,7 @@ const apps: Array<{ app: ReturnType<typeof createApp>; directory: string }> = []
 
 async function testApp(
   fetchImpl: typeof fetch,
-  options: { providers?: ProviderConfig[]; maxRequestLogs?: number; serveDashboard?: boolean; clientKeyStorePath?: string } = {},
+  options: { providers?: ProviderConfig[]; maxRequestLogs?: number; serveDashboard?: boolean; clientKeyStorePath?: string; providerConfigPath?: string } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'ksrouter-test-'));
   const app = createApp({
@@ -22,6 +22,7 @@ async function testApp(
     fetchImpl,
     maxRequestLogs: options.maxRequestLogs,
     clientKeyStorePath: options.clientKeyStorePath ?? join(directory, 'keys.json'),
+    providerConfigPath: options.providerConfigPath ?? join(directory, 'providers.json'),
   });
   apps.push({ app, directory });
   await app.ready();
@@ -354,6 +355,172 @@ describe('K\'sRouter API', () => {
     const response = await app.inject({ method: 'GET', url: '/admin/overview', headers: adminHeaders() });
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().clientKeyCount, 1);
+  });
+
+  it('persists dashboard provider creation and edits across restarts without replacing omitted credentials', async () => {
+    const received: Array<{ url: string; key: string | null }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      received.push({ url: String(input), key: new Headers(init?.headers).get('x-goog-api-key') ?? new Headers(init?.headers).get('authorization') });
+      if (String(input).includes('/models/')) {
+        return Response.json({ responseId: 'persisted-gemini', candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] });
+      }
+      return Response.json({ choices: [{ message: { content: 'ok' } }] });
+    };
+    const first = await testApp(fetchImpl);
+    const configPath = join(first.testDirectory, 'providers.json');
+    const clientStorePath = join(first.testDirectory, 'keys.json');
+
+    const created = await first.app.inject({
+      method: 'PUT', url: '/admin/providers/google',
+      headers: adminHeaders(), payload: {
+        type: 'gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        apiKey: 'persisted-gemini-secret',
+        models: ['gemini-model-v1'],
+      },
+    });
+    assert.equal(created.statusCode, 200);
+    assert.equal(created.json().provider.type, 'gemini');
+    assert.equal(JSON.stringify(created.json()).includes('persisted-gemini-secret'), false);
+
+    const updated = await first.app.inject({
+      method: 'PUT', url: '/admin/providers/google',
+      headers: adminHeaders(), payload: {
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        models: ['gemini-model-v2'],
+      },
+    });
+    assert.equal(updated.statusCode, 200);
+    assert.equal(updated.json().provider.type, 'gemini');
+
+    const persistedText = await readFile(configPath, 'utf8');
+    const persisted = JSON.parse(persistedText);
+    assert.equal(persisted.version, 1);
+    assert.equal(persisted.providers.find((provider: ProviderConfig) => provider.name === 'google').apiKey, 'persisted-gemini-secret');
+    assert.deepEqual(persisted.providers.find((provider: ProviderConfig) => provider.name === 'google').models, ['gemini-model-v2']);
+    assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(first.testDirectory)).mode & 0o777, 0o700);
+    const listed = await first.app.inject({ method: 'GET', url: '/admin/providers', headers: adminHeaders() });
+    assert.equal(JSON.stringify(listed.json()).includes('persisted-gemini-secret'), false);
+
+    const restarted = createApp({
+      adminApiKey: adminKey,
+      providers: [
+        { name: 'default', baseUrl: 'https://environment-changed.test/v1', apiKey: 'environment-new-secret', models: ['env-model'] },
+        { name: 'environment-only', baseUrl: 'https://environment-only.test/v1', apiKey: 'env-only-secret', models: ['env-only-model'] },
+      ],
+      serveDashboard: false,
+      clientKeyStorePath: clientStorePath,
+      providerConfigPath: configPath,
+      fetchImpl,
+    });
+    apps.push({ app: restarted, directory: first.testDirectory });
+    await restarted.ready();
+    const restartedProviders = await restarted.inject({ method: 'GET', url: '/admin/providers', headers: adminHeaders() });
+    assert.deepEqual(restartedProviders.json().providers.map((provider: { name: string }) => provider.name).sort(), ['default', 'google']);
+    assert.equal(restartedProviders.json().providers.find((provider: { name: string }) => provider.name === 'google').hasApiKey, true);
+    assert.equal(JSON.stringify(restartedProviders.json()).includes('persisted-gemini-secret'), false);
+
+    const response = await chat(restarted, first.clientKey, {
+      model: 'gemini-model-v2', messages: [{ role: 'user', content: 'hello' }],
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(received.at(-1), {
+      url: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-model-v2:generateContent',
+      key: 'persisted-gemini-secret',
+    });
+    const defaultResponse = await chat(restarted, first.clientKey, { model: 'demo-model', messages: [] });
+    assert.equal(defaultResponse.statusCode, 200);
+    assert.deepEqual(received.at(-1), {
+      url: 'https://provider.test/v1/chat/completions',
+      key: 'Bearer test-provider-secret',
+    });
+  });
+
+  it('persists provider deletions and an empty saved registry takes precedence over environment providers', async () => {
+    const first = await testApp(async () => Response.json({}));
+    const configPath = join(first.testDirectory, 'providers.json');
+    const deleted = await first.app.inject({
+      method: 'DELETE', url: '/admin/providers/default', headers: adminHeaders(),
+    });
+    assert.equal(deleted.statusCode, 204);
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).providers, []);
+
+    const restarted = createApp({
+      adminApiKey: adminKey,
+      providers: [{ name: 'default', baseUrl: 'https://provider.test/v1', apiKey: 'env-secret', models: ['demo-model'] }],
+      serveDashboard: false,
+      clientKeyStorePath: join(first.testDirectory, 'keys.json'),
+      providerConfigPath: configPath,
+      fetchImpl: async () => { throw new Error('deleted provider must not route'); },
+    });
+    apps.push({ app: restarted, directory: first.testDirectory });
+    await restarted.ready();
+    const providers = await restarted.inject({ method: 'GET', url: '/admin/providers', headers: adminHeaders() });
+    assert.deepEqual(providers.json().providers, []);
+    assert.equal((await chat(restarted, first.clientKey, { model: 'demo-model', messages: [] })).statusCode, 404);
+  });
+
+  it('rejects invalid provider configuration without persisting it or changing existing routes', async () => {
+    const { app, testDirectory } = await testApp(async () => Response.json({}));
+    const configPath = join(testDirectory, 'providers.json');
+    const admin = async (url: string, payload: any) => await app.inject({
+      method: 'PUT', url, headers: adminHeaders(), payload,
+    });
+    const validNewProvider = {
+      type: 'openai', baseUrl: 'https://new-provider.test/v1', apiKey: 'new-secret', models: ['new-model'],
+    };
+    assert.equal((await admin('/admin/providers/bad%20id', validNewProvider)).statusCode, 400);
+    assert.equal((await admin('/admin/providers/new', { ...validNewProvider, baseUrl: 'http://remote.test/v1' })).statusCode, 400);
+    assert.equal((await admin('/admin/providers/new', { ...validNewProvider, baseUrl: 'https://user:pass@new-provider.test/v1' })).statusCode, 400);
+    assert.equal((await admin('/admin/providers/new', { ...validNewProvider, type: 'unknown' })).statusCode, 400);
+    assert.equal((await admin('/admin/providers/new', { ...validNewProvider, models: [''] })).statusCode, 400);
+    assert.equal((await admin('/admin/providers/new', { ...validNewProvider, models: [4] })).statusCode, 400);
+    assert.equal((await admin('/admin/providers/new', { ...validNewProvider, apiKey: undefined })).statusCode, 400);
+    await assert.rejects(readFile(configPath, 'utf8'), { code: 'ENOENT' });
+
+    const created = await admin('/admin/providers/new', validNewProvider);
+    assert.equal(created.statusCode, 200);
+    const beforeConflict = await readFile(configPath, 'utf8');
+    const conflict = await admin('/admin/providers/other', { ...validNewProvider, models: ['demo-model'] });
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(await readFile(configPath, 'utf8'), beforeConflict);
+    assert.equal((await app.inject({ method: 'GET', url: '/admin/providers', headers: adminHeaders() })).json().providers.length, 2);
+  });
+
+  it('fails startup on corrupt provider storage without overwriting the file', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ksrouter-corrupt-provider-store-'));
+    const configPath = join(directory, 'providers.json');
+    const invalid = '{ invalid provider json';
+    await writeFile(configPath, invalid, { mode: 0o600 });
+    const app = createApp({
+      adminApiKey: adminKey,
+      serveDashboard: false,
+      providers: [{ name: 'default', baseUrl: 'https://provider.test/v1', apiKey: 'environment-secret', models: ['demo-model'] }],
+      clientKeyStorePath: join(directory, 'keys.json'),
+      providerConfigPath: configPath,
+      fetchImpl: async () => Response.json({}),
+    });
+    apps.push({ app, directory });
+    await assert.rejects(async () => { await app.ready(); }, /invalid JSON; refusing to replace it/);
+    assert.equal(await readFile(configPath, 'utf8'), invalid);
+  });
+
+  it('fails startup when the provider storage path is unreadable and leaves that path untouched', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ksrouter-unreadable-provider-store-'));
+    const configPath = join(directory, 'providers.json');
+    await mkdir(configPath);
+    const app = createApp({
+      adminApiKey: adminKey,
+      serveDashboard: false,
+      providers: [{ name: 'default', baseUrl: 'https://provider.test/v1', apiKey: 'environment-secret', models: ['demo-model'] }],
+      clientKeyStorePath: join(directory, 'keys.json'),
+      providerConfigPath: configPath,
+      fetchImpl: async () => Response.json({}),
+    });
+    apps.push({ app, directory });
+    await assert.rejects(async () => { await app.ready(); }, /not a regular file; refusing to replace it/);
+    assert.equal((await stat(configPath)).isDirectory(), true);
   });
 
   it('serves the dashboard shell while keeping admin data protected', async () => {

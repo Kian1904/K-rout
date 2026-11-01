@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import { ClientKeyStore } from './client-key-store.js';
+import { ProviderConfigStore, type StoredProvider } from './provider-config-store.js';
 import {
   type GeminiResponse,
   GeminiCompatibilityError,
@@ -41,6 +42,7 @@ export interface RouterConfig {
   port?: number;
   maxRequestLogs?: number;
   clientKeyStorePath?: string;
+  providerConfigPath?: string;
   fetchImpl?: typeof fetch;
   serveDashboard?: boolean;
 }
@@ -81,6 +83,7 @@ function safeProvider(provider: ProviderConfig) {
 
 function readProviderUpdate(body: ProviderUpdateBody, current?: ProviderConfig): ProviderConfig | null {
   if (typeof body.baseUrl !== 'string' || !Array.isArray(body.models)) return null;
+  if (body.apiKey !== undefined && typeof body.apiKey !== 'string') return null;
   let url: URL;
   try {
     url = new URL(body.baseUrl);
@@ -91,7 +94,9 @@ function readProviderUpdate(body: ProviderUpdateBody, current?: ProviderConfig):
   const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]';
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) return null;
 
-  const models = body.models.map((model) => typeof model === 'string' ? model.trim() : '').filter(Boolean);
+  if (body.models.some((model) => typeof model !== 'string')) return null;
+  const models = body.models.map((model) => (model as string).trim());
+  if (models.some((model) => !model || model.length > 200)) return null;
   const apiKey = typeof body.apiKey === 'string' && body.apiKey.trim()
     ? body.apiKey.trim()
     : current?.apiKey;
@@ -103,27 +108,87 @@ function readProviderUpdate(body: ProviderUpdateBody, current?: ProviderConfig):
   return { name: current?.name ?? '', type, baseUrl: body.baseUrl.trim().replace(/\/+$/, ''), apiKey, models };
 }
 
+function validateProviderRegistry(input: ProviderConfig[]): ProviderConfig[] {
+  const providers = input.map((provider) => ({
+    ...provider,
+    type: provider.type ?? 'openai',
+    baseUrl: provider.baseUrl?.trim().replace(/\/+$/, ''),
+    apiKey: provider.apiKey?.trim(),
+    models: Array.isArray(provider.models) ? [...provider.models] : [],
+  }));
+  const ids = new Set<string>();
+  const models = new Set<string>();
+  for (const provider of providers) {
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(provider.name)
+      || (provider.type !== 'openai' && provider.type !== 'gemini')
+      || !provider.apiKey
+      || provider.models.length === 0
+      || provider.models.some((model) => typeof model !== 'string' || !model || model !== model.trim() || model.length > 200)) {
+      throw new Error('Provider configuration is invalid.');
+    }
+    let url: URL;
+    try {
+      url = new URL(provider.baseUrl);
+    } catch {
+      throw new Error('Provider configuration is invalid.');
+    }
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || ids.has(provider.name)) {
+      throw new Error('Provider configuration is invalid.');
+    }
+    ids.add(provider.name);
+    for (const model of provider.models) {
+      if (models.has(model)) throw new Error('Provider model routes conflict.');
+      models.add(model);
+    }
+    if (new Set(provider.models).size !== provider.models.length) throw new Error('Provider model routes conflict.');
+  }
+  return providers;
+}
+
+function toStoredProvider(provider: ProviderConfig): StoredProvider {
+  return {
+    name: provider.name,
+    type: provider.type ?? 'openai',
+    baseUrl: provider.baseUrl,
+    apiKey: provider.apiKey,
+    models: [...provider.models],
+  };
+}
+
+async function withProviderMutation<T>(operation: () => Promise<T>): Promise<T> {
+  let release!: () => void;
+  const previous = providerMutationQueue;
+  providerMutationQueue = new Promise<void>((resolveQueue) => { release = resolveQueue; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+let providerMutationQueue = Promise.resolve();
+
 export function createApp(config: RouterConfig): FastifyInstance {
   if (!config.adminApiKey) throw new Error('ADMIN_API_KEY is required.');
 
   const providers = new Map<string, ProviderConfig>();
-  const configuredModels = new Set<string>();
-  for (const provider of config.providers) {
-    if (providers.has(provider.name)) throw new Error(`Provider "${provider.name}" is configured more than once.`);
-    for (const model of provider.models) {
-      if (configuredModels.has(model)) throw new Error(`Model "${model}" is configured for more than one provider.`);
-      configuredModels.add(model);
-    }
-    providers.set(provider.name, { ...provider, models: [...provider.models] });
-  }
   const requestLogs: RequestLog[] = [];
   const logLimit = Math.max(1, config.maxRequestLogs ?? DEFAULT_LOG_LIMIT);
   const startedAt = Date.now();
   const fetchImpl = config.fetchImpl ?? fetch;
   const adminKeyHash = createHash('sha256').update(config.adminApiKey).digest();
   const clientKeyStore = new ClientKeyStore(config.clientKeyStorePath ?? resolve(process.cwd(), '.data/client-keys.json'));
+  const providerConfigPath = config.providerConfigPath ?? process.env.PROVIDER_CONFIG_PATH ?? '.data/providers.json';
+  const providerConfigStore = new ProviderConfigStore(resolve(process.cwd(), providerConfigPath));
   const app = Fastify({ logger: false });
-  app.addHook('onReady', async () => clientKeyStore.initialize());
+  app.addHook('onReady', async () => {
+    const savedProviders = await providerConfigStore.load();
+    const initialProviders = validateProviderRegistry(savedProviders ?? config.providers);
+    providers.clear();
+    for (const provider of initialProviders) providers.set(provider.name, provider);
+    await clientKeyStore.initialize();
+  });
 
   const models = () => [...providers.values()].flatMap((provider) =>
     provider.models.map((model) => ({ model, provider: provider.name })),
@@ -379,22 +444,40 @@ export function createApp(config: RouterConfig): FastifyInstance {
     admin.put<{ Params: { id: string }; Body: ProviderUpdateBody }>('/providers/:id', async (request, reply) => {
       const id = request.params.id;
       if (!/^[a-zA-Z0-9_-]+$/.test(id)) return reply.code(400).send(errorResponse('Invalid provider id.'));
-      const current = providers.get(id);
-      const updated = readProviderUpdate(request.body ?? {}, current);
-      if (!updated) return reply.code(400).send(errorResponse('Provide a valid HTTPS base URL, API key, and at least one model.'));
-      for (const [otherId, other] of providers) {
-        if (otherId !== id && updated.models.some((model) => other.models.includes(model))) {
-          return reply.code(409).send(errorResponse('Each model can be assigned to only one provider.'));
+      return withProviderMutation(async () => {
+        const current = providers.get(id);
+        const updated = readProviderUpdate(request.body ?? {}, current);
+        if (!updated) return reply.code(400).send(errorResponse('Provide a valid HTTPS base URL, provider type, API key, and model list.'));
+        updated.name = id;
+        const next = [...providers.values()].filter((provider) => provider.name !== id).concat(updated);
+        try {
+          const validated = validateProviderRegistry(next);
+          await providerConfigStore.save(validated.map(toStoredProvider));
+          providers.clear();
+          for (const provider of validated) providers.set(provider.name, provider);
+        } catch (error) {
+          if (error instanceof Error && error.message === 'Provider model routes conflict.') {
+            return reply.code(409).send(errorResponse('Each model can be assigned to only one provider.'));
+          }
+          return reply.code(500).send(errorResponse('Provider configuration could not be saved.', 'storage_error'));
         }
-      }
-      updated.name = id;
-      providers.set(id, updated);
-      return { provider: safeProvider(updated) };
+        return { provider: safeProvider(updated) };
+      });
     });
 
     admin.delete<{ Params: { id: string } }>('/providers/:id', async (request, reply) => {
-      if (!providers.delete(request.params.id)) return reply.code(404).send(errorResponse('Provider not found.', 'not_found'));
-      return reply.code(204).send();
+      return withProviderMutation(async () => {
+        const id = request.params.id;
+        if (!providers.has(id)) return reply.code(404).send(errorResponse('Provider not found.', 'not_found'));
+        const next = [...providers.values()].filter((provider) => provider.name !== id);
+        try {
+          await providerConfigStore.save(next.map(toStoredProvider));
+        } catch {
+          return reply.code(500).send(errorResponse('Provider configuration could not be saved.', 'storage_error'));
+        }
+        providers.delete(id);
+        return reply.code(204).send();
+      });
     });
 
     admin.get('/models', async () => ({ models: models() }));
