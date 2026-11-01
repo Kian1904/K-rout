@@ -4,13 +4,13 @@ Thanks for considering a contribution. K'sRouter is a self-hosted AI gateway. Ke
 
 ## Before you start
 
-- For bugs or feature proposals, check [open issues](https://github.com/Kian1904/K-sRouter-CLI/issues) first.
+- For bugs or feature proposals, check [open issues](https://github.com/Kian1904/K-rout/issues) first.
 - For security vulnerabilities, **do not post credentials, tokens, or exploitation details in public issues**. Contact the maintainer privately using a GitHub-supported private channel if available.
 - For larger changes, open an issue describing the problem, expected behavior, and intended scope before implementing.
 
 ## Local development
 
-Requirements: Node.js 20.6+ and npm.
+Requirements: Node.js 22 or 24 recommended (CI-tested), and npm. Other versions are outside the current CI matrix.
 
 ```sh
 npm ci

@@ -25,7 +25,7 @@ Please do not report security vulnerabilities through public GitHub Issues, Pull
 
 Use GitHub's Private Vulnerability Reporting feature instead:
 
-"Report a Vulnerability Privately" (https://github.com/Kian1904/K-sRouter-CLI/security/advisories/new)
+"Report a Vulnerability Privately" (https://github.com/Kian1904/K-rout/security/advisories/new)
 
 When submitting a report, please include:
 
@@ -113,11 +113,11 @@ Non-Security Issues
 
 For regular bugs, feature requests, and documentation improvements, please use:
 
-"GitHub Issues" (https://github.com/Kian1904/K-sRouter-CLI/issues)
+"GitHub Issues" (https://github.com/Kian1904/K-rout/issues)
 
 For contribution instructions, see:
 
-"CONTRIBUTING.md" (https://github.com/Kian1904/K-sRouter-CLI/blob/main/CONTRIBUTING.md)
+"CONTRIBUTING.md" (https://github.com/Kian1904/K-rout/blob/main/CONTRIBUTING.md)
 
 ---
 
