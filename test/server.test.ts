@@ -357,6 +357,61 @@ describe('K\'sRouter API', () => {
     assert.equal(response.json().clientKeyCount, 1);
   });
 
+  it('rejects unauthorized admin mutations without changing providers or stored client keys', async () => {
+    const { app, clientKey, testDirectory } = await testApp(async () =>
+      Response.json({ choices: [{ message: { content: 'ok' } }] }));
+    const providerPath = join(testDirectory, 'providers.json');
+    const clientKeysPath = join(testDirectory, 'keys.json');
+    const providerPayload = {
+      type: 'openai', baseUrl: 'https://extra-provider.test/v1',
+      apiKey: 'additional-provider-secret', models: ['additional-model'],
+    };
+
+    // Create a persisted provider registry before capturing the baseline.
+    const setup = await app.inject({
+      method: 'PUT', url: '/admin/providers/extra',
+      headers: adminHeaders(), payload: providerPayload,
+    });
+    assert.equal(setup.statusCode, 200);
+    const providersBefore = await readFile(providerPath, 'utf8');
+    const keysBefore = await readFile(clientKeysPath, 'utf8');
+    const listedKeys = await app.inject({ method: 'GET', url: '/admin/client-keys', headers: adminHeaders() });
+    assert.equal(listedKeys.statusCode, 200);
+    const keyId = listedKeys.json().clientKeys[0].id as string;
+
+    const mutations = [
+      { method: 'PUT', url: '/admin/providers/extra', payload: { ...providerPayload, models: ['hijacked-model'] } },
+      { method: 'PUT', url: '/admin/providers/injected', payload: providerPayload },
+      { method: 'DELETE', url: '/admin/providers/extra' },
+      { method: 'POST', url: '/admin/client-keys', payload: { name: 'unauthorized key' } },
+      { method: 'DELETE', url: `/admin/client-keys/${keyId}` },
+    ] as const;
+
+    for (const [identity, headers] of [
+      ['missing', {}],
+      ['invalid', adminHeaders('wrong-admin-secret')],
+      ['client', adminHeaders(clientKey)],
+    ] as const) {
+      for (const mutation of mutations) {
+        const response = await app.inject({ ...mutation, headers });
+        assert.equal(response.statusCode, 401, `${identity} auth must not allow ${mutation.method} ${mutation.url}`);
+        assert.equal(response.json().error.type, 'authentication_error');
+        assert.equal(response.body.includes('additional-provider-secret'), false);
+        assert.equal(response.body.includes(clientKey), false);
+      }
+      assert.equal(await readFile(providerPath, 'utf8'), providersBefore, `${identity} auth must not alter provider storage`);
+      assert.equal(await readFile(clientKeysPath, 'utf8'), keysBefore, `${identity} auth must not alter client-key storage`);
+    }
+
+    const providersAfter = await app.inject({ method: 'GET', url: '/admin/providers', headers: adminHeaders() });
+    assert.equal(providersAfter.statusCode, 200);
+    assert.deepEqual(providersAfter.json().providers.map((provider: { name: string }) => provider.name).sort(), ['default', 'extra']);
+    const keysAfter = await app.inject({ method: 'GET', url: '/admin/client-keys', headers: adminHeaders() });
+    assert.deepEqual(keysAfter.json(), listedKeys.json());
+    assert.equal((await chat(app, clientKey, { model: 'demo-model', messages: [] })).statusCode, 200);
+    assert.equal((await chat(app, clientKey, { model: 'hijacked-model', messages: [] })).statusCode, 404);
+  });
+
   it('persists dashboard provider creation and edits across restarts without replacing omitted credentials', async () => {
     const received: Array<{ url: string; key: string | null }> = [];
     const fetchImpl: typeof fetch = async (input, init) => {
