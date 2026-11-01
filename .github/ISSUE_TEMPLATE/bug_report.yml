@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible K'sRouter defect (do not include secrets).
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security vulnerability?** Do not file a public issue containing exploitation details or sensitive tokens. Use a private maintainer contact channel if available.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+      placeholder: "Observed behavior vs expected behavior"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Share a minimal, sanitized reproduction. Use dummy API keys.
+      placeholder: |
+        1. Configure mock provider...
+        2. Send request...
+        3. Observe...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "v0.1.0 / commit SHA"
+  - type: input
+    id: platform
+    attributes:
+      label: Environment
+      placeholder: "Android Termux / Node 26 / ARM64"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or output
+      description: Remove API keys, bearer tokens, personal information, and message content before posting.
+      render: shell
