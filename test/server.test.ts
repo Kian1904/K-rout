@@ -367,6 +367,54 @@ describe('K\'sRouter API', () => {
     assert.equal(JSON.stringify(logs.json()).includes(privateMessage), false);
   });
 
+  it('aborts an OpenAI-compatible SSE upstream when the client disconnects', async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    const { app, clientKey } = await testApp(async (_input, init) => {
+      upstreamSignal = init?.signal as AbortSignal;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"first"}}]}\\n\\n'.replaceAll('\\n', '\n')));
+          upstreamSignal?.addEventListener('abort', () => {
+            controller.error(new Error('upstream cancelled'));
+          }, { once: true });
+        },
+      });
+      return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+    });
+
+    await app.listen({ host: '127.0.0.1', port: 0 });
+    const address = app.server.address();
+    assert.ok(address && typeof address !== 'string');
+    const clientController = new AbortController();
+    const response = await fetch('http://127.0.0.1:' + address.port + '/v1/chat/completions', {
+      method: 'POST', signal: clientController.signal,
+      headers: { authorization: 'Bearer ' + clientKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'demo-model', messages: [], stream: true }),
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false);
+    assert.match(new TextDecoder().decode(first.value), /first/);
+    assert.ok(upstreamSignal, 'the gateway must supply an abort signal to upstream fetch');
+
+    const aborted = new Promise<void>((resolve) => {
+      if (upstreamSignal!.aborted) resolve();
+      else upstreamSignal!.addEventListener('abort', () => resolve(), { once: true });
+    });
+    clientController.abort();
+    try {
+      await Promise.race([
+        aborted,
+        new Promise<void>((_resolve, reject) =>
+          setTimeout(() => reject(new Error('OpenAI upstream cancellation timed out')), 1000)),
+      ]);
+      assert.equal(upstreamSignal.aborted, true);
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+  });
+
   it('rejects malformed authenticated request bodies', async () => {
     const { app, clientKey } = await testApp(async () => { throw new Error('must not call provider'); });
     const response = await chat(app, clientKey, { model: 4 });
