@@ -4,7 +4,7 @@ K'sRouter is an independent, self-hosted, multi-provider AI gateway built with T
 
 ## Requirements
 
-- Node.js 20.6 or newer
+- Node.js 22 or 24 recommended (the versions covered by CI); other versions are not part of the current CI matrix
 - An OpenAI-compatible provider or Google Gemini API key
 
 ## Configure
@@ -91,7 +91,7 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-The dashboard can list, add, edit, and remove providers; manage client keys; list model routes; view request metadata; and inspect runtime settings. Provider API keys are accepted by the server but never returned to the dashboard. Provider dashboard changes are in-memory only. Request logs retain up to 100 recent entries by default and contain only status, provider, model, timestamp, and latency—not message contents or credentials.
+The dashboard can list, add, edit, and remove providers; manage client keys; list model routes; view request metadata; and inspect runtime settings. Provider API keys are accepted by the server but never returned to the dashboard. Provider dashboard changes persist across restarts in the local JSON provider registry (see [Provider configuration persistence](#provider-configuration-persistence)). Request logs retain up to 100 recent entries by default and contain only status, provider, model, timestamp, and latency—not message contents or credentials.
 
 ## Gemini compatibility
 
