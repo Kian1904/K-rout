@@ -99,6 +99,16 @@ The Gemini adapter translates OpenAI chat messages (system, developer, user, and
 
 This initial adapter supports text-only conversations and one completion choice. It rejects OpenAI tool/function calling, non-text message parts (including image/audio/video), response_format, logprobs, and logit_bias; it does not translate multimodal output, tool calls, multiple Gemini candidates, Gemini safety ratings, citations, or other Gemini-specific metadata. Gemini thinking-only parts are omitted from assistant text. Gemini-specific generation settings with no OpenAI request equivalent are not configurable through this adapter. Provider HTTP and malformed-payload errors are returned as sanitized gateway errors. A mid-stream Gemini error closes the stream and is recorded as a failed request; an OpenAI-style in-band error event is not synthesized.
 
+## Anthropic compatibility
+
+The Anthropic adapter translates OpenAI chat completions requests to the native Anthropic Messages API. It keeps the public client surface `/v1/chat/completions`; provider credentials stay server-side and are sent as `x-api-key` with `anthropic-version: 2023-06-01`. Base URLs ending in `/v1` map to `/v1/messages` automatically.
+
+Supported request translation: `system`/`developer` messages become the Anthropic `system` field, user/assistant messages become Anthropic content, and `temperature`, `top_p`, `top_k`, `max_tokens`/`max_completion_tokens`, and `stop` map to their Anthropic equivalents. OpenAI `tools` (function type) translate to Anthropic `tools` with `input_schema`; `tool_choice` values `auto`, `none`, `required`/`any`, and named function choices are mapped. Assistant `tool_calls` become `tool_use` blocks and `tool` role messages become `tool_result` blocks (adjacent same-role blocks are merged to satisfy Anthropic turn rules). Multimodal `image_url` content parts are translated to Anthropic `image` blocks (base64 data URLs and http(s) URLs).
+
+Supported response translation: non-streaming responses map text and `tool_use` blocks back to OpenAI `choices[0].message.content` / `tool_calls`, with `stop_reason` mapped to `stop`, `length`, or `tool_calls`. Streaming translates Anthropic SSE events to OpenAI chat completion chunks: text deltas become `content` deltas and `tool_use` blocks become incremental `tool_calls` deltas (start chunk with id/name, followed by `input_json_delta` argument chunks). Token usage is preserved when provided (including stream usage).
+
+Not yet supported: legacy `functions`/`function_call`, `response_format`, `logprobs`, `logit_bias`, audio content parts, `n > 1`, and non-text/non-image multimodal parts. Upstream Anthropic errors are returned as sanitized gateway errors.
+
 Run the production build and automated tests with:
 
 ```sh

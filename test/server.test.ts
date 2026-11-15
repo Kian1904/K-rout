@@ -887,7 +887,7 @@ describe('K\'sRouter API', () => {
     const body = JSON.parse(receivedBody);
     assert.equal(body.system, 'be brief');
     assert.equal(body.max_tokens, 128);
-    assert.deepEqual(body.messages, [{ role: 'user', content: 'Hello' }]);
+    assert.deepEqual(body.messages, [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }]);
 
     const payload = response.json();
     assert.equal(payload.object, 'chat.completion');
@@ -933,9 +933,175 @@ describe('K\'sRouter API', () => {
     const response = await chat(app, clientKey, {
       model: 'claude-test',
       messages: [{ role: 'user', content: 'Hello' }],
-      tools: [{ type: 'function', function: { name: 'x' } }],
+      response_format: { type: 'json_object' },
     });
     assert.equal(response.statusCode, 400);
     assert.equal(calls, 0);
+  });
+
+  it('translates Anthropic tool definitions and tool choice', async () => {
+    let receivedBody = '';
+    const { app, clientKey } = await testApp(async (_input, init) => {
+      receivedBody = String(init?.body);
+      return Response.json({
+        id: 'msg_tools',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-test',
+        content: [{ type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: { city: 'Jakarta' } }],
+        stop_reason: 'tool_use',
+      });
+    }, { providers: [{
+      name: 'claude', type: 'anthropic', baseUrl: 'https://api.anthropic.test/v1', apiKey: 'anthropic-secret', models: ['claude-test'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'claude-test',
+      messages: [{ role: 'user', content: 'Weather in Jakarta?' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Look up weather',
+          parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+        },
+      }],
+      tool_choice: { type: 'function', function: { name: 'get_weather' } },
+    });
+    assert.equal(response.statusCode, 200);
+
+    const body = JSON.parse(receivedBody);
+    assert.deepEqual(body.tools, [{
+      name: 'get_weather',
+      description: 'Look up weather',
+      input_schema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+    }]);
+    assert.deepEqual(body.tool_choice, { type: 'tool', name: 'get_weather' });
+
+    const payload = response.json();
+    assert.equal(payload.choices[0].finish_reason, 'tool_calls');
+    assert.equal(payload.choices[0].message.content, null);
+    assert.deepEqual(payload.choices[0].message.tool_calls, [{
+      id: 'toolu_1',
+      type: 'function',
+      function: { name: 'get_weather', arguments: '{"city":"Jakarta"}' },
+    }]);
+  });
+
+  it('sends Anthropic tool results back as tool_result blocks', async () => {
+    let receivedBody = '';
+    const { app, clientKey } = await testApp(async (_input, init) => {
+      receivedBody = String(init?.body);
+      return Response.json({
+        id: 'msg_result',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-test',
+        content: [{ type: 'text', text: 'It is sunny.' }],
+        stop_reason: 'end_turn',
+      });
+    }, { providers: [{
+      name: 'claude', type: 'anthropic', baseUrl: 'https://api.anthropic.test/v1', apiKey: 'anthropic-secret', models: ['claude-test'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'claude-test',
+      messages: [
+        { role: 'user', content: 'Weather in Jakarta?' },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'toolu_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Jakarta"}' } }] },
+        { role: 'tool', tool_call_id: 'toolu_1', content: 'Sunny, 31C' },
+      ],
+      tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } }],
+    });
+    assert.equal(response.statusCode, 200);
+
+    const body = JSON.parse(receivedBody);
+    assert.deepEqual(body.messages, [
+      { role: 'user', content: [{ type: 'text', text: 'Weather in Jakarta?' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: { city: 'Jakarta' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'Sunny, 31C' }] },
+    ]);
+  });
+
+  it('translates Anthropic image content parts', async () => {
+    let receivedBody = '';
+    const { app, clientKey } = await testApp(async (_input, init) => {
+      receivedBody = String(init?.body);
+      return Response.json({
+        id: 'msg_vision',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-test',
+        content: [{ type: 'text', text: 'A cat.' }],
+        stop_reason: 'end_turn',
+      });
+    }, { providers: [{
+      name: 'claude', type: 'anthropic', baseUrl: 'https://api.anthropic.test/v1', apiKey: 'anthropic-secret', models: ['claude-test'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'claude-test',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What is this?' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          { type: 'image_url', image_url: { url: 'https://example.test/cat.png' } },
+        ],
+      }],
+    });
+    assert.equal(response.statusCode, 200);
+
+    const body = JSON.parse(receivedBody);
+    assert.deepEqual(body.messages, [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is this?' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+        { type: 'image', source: { type: 'url', url: 'https://example.test/cat.png' } },
+      ],
+    }]);
+  });
+
+  it('streams Anthropic tool calls as incremental tool_calls deltas', async () => {
+    const sse = [
+      'data: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":4,"output_tokens":0}}}',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":"}}',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"Jakarta\\"}"}}',
+      'data: {"type":"content_block_stop","index":0}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n\n');
+    const { app, clientKey } = await testApp(async () => new Response(sse, {
+      headers: { 'content-type': 'text/event-stream' },
+    }), { providers: [{
+      name: 'claude', type: 'anthropic', baseUrl: 'https://api.anthropic.test/v1', apiKey: 'anthropic-secret', models: ['claude-test'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'claude-test',
+      messages: [{ role: 'user', content: 'Weather?' }],
+      stream: true,
+    });
+    assert.equal(response.statusCode, 200);
+    const events = response.body.split('\n').filter((line) => line.startsWith('data: ')).map((line) => line.slice(6));
+    assert.equal(events.at(-1), '[DONE]');
+    const chunks = events.filter((event) => event !== '[DONE]').map((event) => JSON.parse(event));
+
+    const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls);
+    assert.equal(toolChunks.length, 3);
+    assert.deepEqual(toolChunks[0].choices[0].delta.tool_calls[0], {
+      index: 0,
+      id: 'toolu_1',
+      type: 'function',
+      function: { name: 'get_weather', arguments: '' },
+    });
+    const args = toolChunks.map((chunk) => chunk.choices[0].delta.tool_calls[0].function.arguments ?? '').join('');
+    assert.equal(args, '{"city":"Jakarta"}');
+
+    const final = chunks.find((chunk) => chunk.choices[0]?.finish_reason);
+    assert.equal(final?.choices[0].finish_reason, 'tool_calls');
   });
 });

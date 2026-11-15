@@ -2,7 +2,14 @@ import { randomUUID } from 'node:crypto';
 
 export class AnthropicCompatibilityError extends Error {}
 
-type ChatMessage = { role?: unknown; content?: unknown; tool_calls?: unknown; function_call?: unknown };
+type ChatMessage = {
+  role?: unknown;
+  content?: unknown;
+  tool_calls?: unknown;
+  tool_call_id?: unknown;
+  function_call?: unknown;
+  name?: unknown;
+};
 type ChatRequest = {
   model?: unknown;
   messages?: unknown;
@@ -30,30 +37,22 @@ export type AnthropicResponse = {
   type?: string;
   role?: string;
   model?: string;
-  content?: Array<{ type?: string; text?: string }>;
+  content?: AnthropicContentBlock[];
   stop_reason?: string | null;
   stop_sequence?: string | null;
   usage?: { input_tokens?: number; output_tokens?: number };
   error?: unknown;
 };
 
+export type AnthropicContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool_use'; id: string; name: string; input: unknown }
+  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+  | { type: 'image'; source: { type: string; media_type?: string; data?: string; url?: string } };
+
 const DEFAULT_MAX_TOKENS = 4096;
 
-function textFromContent(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (!part || typeof part !== 'object' || (part as { type?: unknown }).type !== 'text' || typeof (part as { text?: unknown }).text !== 'string') {
-        throw new AnthropicCompatibilityError('Anthropic adapter supports text-only message content.');
-      }
-      return (part as { text: string }).text;
-    }).join('');
-  }
-  throw new AnthropicCompatibilityError('Anthropic adapter requires message content to be text.');
-}
-
 function unsupported(request: ChatRequest) {
-  if (request.tools !== undefined || request.tool_choice !== undefined) throw new AnthropicCompatibilityError('Anthropic adapter does not support [OI] tools or tool_choice yet.');
   if (request.functions !== undefined || request.function_call !== undefined) throw new AnthropicCompatibilityError('Anthropic adapter does not support [OI] function calling yet.');
   if (request.response_format !== undefined) throw new AnthropicCompatibilityError('Anthropic adapter does not support response_format yet.');
   if (request.logprobs !== undefined) throw new AnthropicCompatibilityError('Anthropic adapter does not support logprobs.');
@@ -66,37 +65,217 @@ export function anthropicEndpoint(baseUrl: string): string {
   return root.endsWith('/v1') ? `${root}/messages` : `${root}/v1/messages`;
 }
 
+function parseDataUrl(url: string): { mediaType: string; data: string } | undefined {
+  const match = /^data:([^;,]+);base64,(.*)$/.exec(url);
+  if (!match) return undefined;
+  return { mediaType: match[1], data: match[2] };
+}
+
+function toContentBlocks(content: unknown): AnthropicContentBlock[] {
+  if (typeof content === 'string') {
+    return content ? [{ type: 'text', text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    throw new AnthropicCompatibilityError('Anthropic adapter requires message content to be text or an array of content parts.');
+  }
+  const blocks: AnthropicContentBlock[] = [];
+  for (const rawPart of content) {
+    if (!rawPart || typeof rawPart !== 'object') {
+      throw new AnthropicCompatibilityError('Each content part must be an object.');
+    }
+    const part = rawPart as Record<string, unknown>;
+    if (part.type === 'text') {
+      if (typeof part.text !== 'string') throw new AnthropicCompatibilityError('Text content parts need a text field.');
+      blocks.push({ type: 'text', text: part.text });
+      continue;
+    }
+    if (part.type === 'image_url') {
+      const imageUrl = part.image_url as { url?: unknown } | undefined;
+      const url = typeof imageUrl?.url === 'string' ? imageUrl.url : '';
+      if (!url) throw new AnthropicCompatibilityError('Image content parts need an image_url.url field.');
+      const parsed = parseDataUrl(url);
+      if (parsed) {
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: parsed.mediaType, data: parsed.data } });
+        continue;
+      }
+      if (/^https?:\/\//i.test(url)) {
+        blocks.push({ type: 'image', source: { type: 'url', url } });
+        continue;
+      }
+      throw new AnthropicCompatibilityError('Image URLs must be http(s) URLs or base64 data URLs.');
+    }
+    if (part.type === 'input_audio') {
+      throw new AnthropicCompatibilityError('Anthropic adapter does not support audio content parts.');
+    }
+    throw new AnthropicCompatibilityError(`Anthropic adapter does not support content part type "${String(part.type)}".`);
+  }
+  return blocks;
+}
+
+function textOnly(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) {
+    throw new AnthropicCompatibilityError('Anthropic adapter requires message content to be text or an array of content parts.');
+  }
+  return content.map((part) => {
+    if (!part || typeof part !== 'object' || (part as { type?: unknown }).type !== 'text' || typeof (part as { text?: unknown }).text !== 'string') {
+      throw new AnthropicCompatibilityError('Anthropic adapter supports text-only message content.');
+    }
+    return (part as { text: string }).text;
+  }).join('');
+}
+
+type ToolDefinition = {
+  name: string;
+  description?: string;
+  input_schema: Record<string, unknown>;
+};
+
+function toAnthropicTools(tools: unknown): ToolDefinition[] {
+  if (!Array.isArray(tools) || tools.length === 0) {
+    throw new AnthropicCompatibilityError('Anthropic adapter requires a non-empty tools array.');
+  }
+  return tools.map((rawTool) => {
+    if (!rawTool || typeof rawTool !== 'object') {
+      throw new AnthropicCompatibilityError('Each tool must be an object.');
+    }
+    const tool = rawTool as { type?: unknown; function?: Record<string, unknown> };
+    if (tool.type !== 'function' || !tool.function || typeof tool.function !== 'object') {
+      throw new AnthropicCompatibilityError('Anthropic adapter supports only function-type tools.');
+    }
+    const fn = tool.function;
+    if (typeof fn.name !== 'string' || !fn.name) {
+      throw new AnthropicCompatibilityError('Each tool needs a function name.');
+    }
+    const schema = fn.parameters;
+    return {
+      name: fn.name,
+      ...(typeof fn.description === 'string' ? { description: fn.description } : {}),
+      input_schema: schema && typeof schema === 'object' ? (schema as Record<string, unknown>) : { type: 'object', properties: {} },
+    };
+  });
+}
+
+function toAnthropicToolChoice(toolChoice: unknown): Record<string, unknown> | undefined {
+  if (toolChoice === undefined || toolChoice === null) return undefined;
+  if (typeof toolChoice === 'string') {
+    if (toolChoice === 'auto') return { type: 'auto' };
+    if (toolChoice === 'none') return { type: 'none' };
+    if (toolChoice === 'required' || toolChoice === 'any') return { type: 'any' };
+    throw new AnthropicCompatibilityError('Anthropic adapter supports tool_choice values auto, none, required, or a named function.');
+  }
+  if (typeof toolChoice === 'object') {
+    const choice = toolChoice as { type?: unknown; function?: { name?: unknown } };
+    if (choice.type === 'function' && typeof choice.function?.name === 'string') {
+      return { type: 'tool', name: choice.function.name };
+    }
+  }
+  throw new AnthropicCompatibilityError('Anthropic adapter supports tool_choice values auto, none, required, or a named function.');
+}
+
+function toAnthropicMessages(messages: ChatMessage[]): Array<{ role: 'user' | 'assistant'; content: AnthropicContentBlock[] }> {
+  const contents: Array<{ role: 'user' | 'assistant'; content: AnthropicContentBlock[] }> = [];
+
+  const push = (role: 'user' | 'assistant', blocks: AnthropicContentBlock[]) => {
+    if (!blocks.length) return;
+    const previous = contents[contents.length - 1];
+    if (previous && previous.role === role) {
+      previous.content.push(...blocks);
+      return;
+    }
+    contents.push({ role, content: blocks });
+  };
+
+  for (const message of messages) {
+    const role = message.role;
+    if (role === 'system' || role === 'developer') continue;
+
+    if (role === 'tool') {
+      if (typeof message.tool_call_id !== 'string' || !message.tool_call_id) {
+        throw new AnthropicCompatibilityError('Tool result messages need a tool_call_id.');
+      }
+      push('user', [{
+        type: 'tool_result',
+        tool_use_id: message.tool_call_id,
+        content: textOnly(message.content),
+      }]);
+      continue;
+    }
+
+    if (role !== 'user' && role !== 'assistant') {
+      throw new AnthropicCompatibilityError('Anthropic adapter does not support this message role.');
+    }
+
+    const blocks: AnthropicContentBlock[] = [];
+    const toolCalls = message.tool_calls;
+    if (toolCalls !== undefined) {
+      if (!Array.isArray(toolCalls)) throw new AnthropicCompatibilityError('Tool calls must be an array.');
+      for (const rawCall of toolCalls) {
+        if (!rawCall || typeof rawCall !== 'object') throw new AnthropicCompatibilityError('Each tool call must be an object.');
+        const call = rawCall as { id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } };
+        if (call.type !== undefined && call.type !== 'function') {
+          throw new AnthropicCompatibilityError('Anthropic adapter supports only function-type tool calls.');
+        }
+        const name = call.function?.name;
+        if (typeof name !== 'string' || !name) throw new AnthropicCompatibilityError('Each tool call needs a function name.');
+        const rawArguments = call.function?.arguments;
+        let input: unknown = {};
+        if (typeof rawArguments === 'string' && rawArguments.trim()) {
+          try {
+            input = JSON.parse(rawArguments);
+          } catch {
+            throw new AnthropicCompatibilityError('Tool call arguments must be valid JSON.');
+          }
+        } else if (rawArguments && typeof rawArguments === 'object') {
+          input = rawArguments;
+        }
+        blocks.push({ type: 'tool_use', id: typeof call.id === 'string' ? call.id : randomUUID(), name, input });
+      }
+    }
+
+    const content = message.content;
+    if (content !== undefined && content !== null) {
+      if (typeof content === 'string') {
+        if (content) blocks.unshift({ type: 'text', text: content });
+      } else {
+        blocks.unshift(...toContentBlocks(content));
+      }
+    }
+
+    push(role === 'assistant' ? 'assistant' : 'user', blocks);
+  }
+
+  return contents;
+}
+
 export function toAnthropicRequest(input: Record<string, unknown>): Record<string, unknown> {
   const request = input as ChatRequest;
   unsupported(request);
   if (!Array.isArray(request.messages)) throw new AnthropicCompatibilityError('Anthropic adapter requires a messages array.');
 
   const systemParts: string[] = [];
-  const contents: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  const conversation: ChatMessage[] = [];
   for (const rawMessage of request.messages) {
     if (!rawMessage || typeof rawMessage !== 'object') throw new AnthropicCompatibilityError('Each message must be an object.');
     const message = rawMessage as ChatMessage;
-    if (message.tool_calls !== undefined || message.function_call !== undefined) {
-      throw new AnthropicCompatibilityError('Anthropic adapter does not support tool-call messages yet.');
+    if (message.function_call !== undefined) {
+      throw new AnthropicCompatibilityError('Anthropic adapter does not support legacy function_call messages.');
     }
-    const text = textFromContent(message.content);
     if (message.role === 'system' || message.role === 'developer') {
-      systemParts.push(text);
+      const systemText = typeof message.content === 'string'
+        ? message.content
+        : toContentBlocks(message.content).map((block) => (block.type === 'text' ? block.text : '')).join('');
+      if (systemText) systemParts.push(systemText);
       continue;
     }
-    if (message.role !== 'user' && message.role !== 'assistant') {
-      throw new AnthropicCompatibilityError('Anthropic adapter does not support this message role.');
-    }
-    const role = message.role === 'assistant' ? 'assistant' : 'user';
-    const previous = contents[contents.length - 1];
-    if (previous && previous.role === role) {
-      previous.content += `\n\n${text}`;
-      continue;
-    }
-    contents.push({ role, content: text });
+    conversation.push(message);
   }
+
+  const contents = toAnthropicMessages(conversation);
   if (!contents.length) throw new AnthropicCompatibilityError('At least one user or assistant message is required.');
-  if (!contents[0].role || contents[0].role !== 'user') throw new AnthropicCompatibilityError('Anthropic requires the conversation to start with a user message.');
+  if (contents[0].role !== 'user') {
+    throw new AnthropicCompatibilityError('Anthropic requires the conversation to start with a user message.');
+  }
 
   const body: Record<string, unknown> = {
     model: request.model,
@@ -108,20 +287,41 @@ export function toAnthropicRequest(input: Record<string, unknown>): Record<strin
   if (request.top_p !== undefined) body.top_p = request.top_p;
   if (request.top_k !== undefined) body.top_k = request.top_k;
   if (request.stop !== undefined) body.stop_sequences = Array.isArray(request.stop) ? request.stop : [request.stop];
+  const toolsProvided = Array.isArray(request.tools) && request.tools.length > 0;
+  if (toolsProvided) body.tools = toAnthropicTools(request.tools);
+  const toolChoice = toAnthropicToolChoice(request.tool_choice);
+  if (toolChoice && toolsProvided) body.tool_choice = toolChoice;
   return body;
 }
 
-function finishReason(reason?: string | null): 'stop' | 'length' {
+function finishReason(reason?: string | null): 'stop' | 'length' | 'tool_calls' {
   if (reason === 'max_tokens') return 'length';
+  if (reason === 'tool_use') return 'tool_calls';
   return 'stop';
+}
+
+function toolCallFromBlock(block: Extract<AnthropicContentBlock, { type: 'tool_use' }>) {
+  let args = '{}';
+  if (block.input !== undefined) {
+    args = typeof block.input === 'string' ? block.input : JSON.stringify(block.input);
+  }
+  return {
+    id: block.id,
+    type: 'function' as const,
+    function: { name: block.name, arguments: args },
+  };
 }
 
 export function toOpenAiResponse(response: AnthropicResponse, requestedModel: string) {
   if (response.error) throw new AnthropicCompatibilityError('Anthropic returned an error payload.');
-  const text = (response.content ?? [])
-    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-    .map((part) => part.text)
+  const blocks = response.content ?? [];
+  const text = blocks
+    .filter((block): block is Extract<AnthropicContentBlock, { type: 'text' }> => block?.type === 'text')
+    .map((block) => block.text)
     .join('');
+  const toolCalls = blocks
+    .filter((block): block is Extract<AnthropicContentBlock, { type: 'tool_use' }> => block?.type === 'tool_use')
+    .map(toolCallFromBlock);
   const usage = response.usage
     ? {
         prompt_tokens: response.usage.input_tokens ?? 0,
@@ -136,8 +336,12 @@ export function toOpenAiResponse(response: AnthropicResponse, requestedModel: st
     model: response.model ?? requestedModel,
     choices: [{
       index: 0,
-      message: { role: 'assistant', content: text },
-      finish_reason: finishReason(response.stop_reason),
+      message: {
+        role: 'assistant',
+        content: text || (toolCalls.length ? null : ''),
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: toolCalls.length ? 'tool_calls' : finishReason(response.stop_reason),
     }],
     ...(usage ? { usage } : {}),
   };
@@ -146,7 +350,15 @@ export function toOpenAiResponse(response: AnthropicResponse, requestedModel: st
 type AnthropicStreamEvent = {
   type?: string;
   message?: AnthropicResponse;
-  delta?: { type?: string; text?: string; stop_reason?: string | null };
+  content_block?: AnthropicContentBlock;
+  index?: number;
+  delta?: {
+    type?: string;
+    text?: string;
+    partial_json?: string;
+    stop_reason?: string | null;
+    thinking?: string;
+  };
   usage?: { input_tokens?: number; output_tokens?: number };
 };
 
@@ -207,10 +419,13 @@ export async function* readAnthropicEventStream(body: ReadableStream<Uint8Array>
   }
 }
 
-/**
- * Translates the Anthropic SSE event stream into [OI] chat completion chunks.
- * Yields chunks only; usage is reported through the returned usage accumulator.
- */
+type ToolCallAccumulator = {
+  id: string;
+  name: string;
+  args: string;
+  sent: boolean;
+};
+
 export async function* anthropicStreamChunks(
   body: ReadableStream<Uint8Array>,
   requestedModel: string,
@@ -222,9 +437,18 @@ export async function* anthropicStreamChunks(
   let roleSent = false;
   let usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | undefined;
   let finish: string | null = null;
+  let toolCallIndex = 0;
+  const toolCalls: ToolCallAccumulator[] = [];
+
+  const ensureRole = (): OpenAiStreamChunk | undefined => {
+    if (roleSent) return undefined;
+    roleSent = true;
+    return openAiChunk(model, id, created, { role: 'assistant' });
+  };
 
   for await (const event of readAnthropicEventStream(body)) {
     if (event.type === 'error') throw new AnthropicCompatibilityError('Anthropic returned an error payload.');
+
     if (event.type === 'message_start') {
       const message = event.message;
       if (message?.model) model = message.model;
@@ -235,23 +459,60 @@ export async function* anthropicStreamChunks(
           total_tokens: (message.usage.input_tokens ?? 0) + (message.usage.output_tokens ?? 0),
         };
       }
-      if (!roleSent) {
-        roleSent = true;
-        yield openAiChunk(model, id, created, { role: 'assistant' });
+      const roleChunk = ensureRole();
+      if (roleChunk) yield roleChunk;
+      continue;
+    }
+
+    if (event.type === 'content_block_start') {
+      const block = event.content_block;
+      if (block?.type === 'tool_use') {
+        const roleChunk = ensureRole();
+        if (roleChunk) yield roleChunk;
+        const accumulator: ToolCallAccumulator = {
+          id: block.id,
+          name: block.name,
+          args: '',
+          sent: false,
+        };
+        toolCalls.push(accumulator);
+        yield openAiChunk(model, id, created, {
+          tool_calls: [{
+            index: toolCallIndex++,
+            id: block.id,
+            type: 'function',
+            function: { name: block.name, arguments: '' },
+          }],
+        });
+        accumulator.sent = true;
       }
       continue;
     }
+
     if (event.type === 'content_block_delta') {
       const text = event.delta?.text;
       if (typeof text === 'string' && text) {
-        if (!roleSent) {
-          roleSent = true;
-          yield openAiChunk(model, id, created, { role: 'assistant' });
-        }
+        const roleChunk = ensureRole();
+        if (roleChunk) yield roleChunk;
         yield openAiChunk(model, id, created, { content: text });
+        continue;
+      }
+      const partial = event.delta?.partial_json;
+      if (typeof partial === 'string' && partial) {
+        const accumulator = toolCalls[toolCalls.length - 1];
+        if (accumulator) {
+          accumulator.args += partial;
+          yield openAiChunk(model, id, created, {
+            tool_calls: [{
+              index: toolCallIndex - 1,
+              function: { arguments: partial },
+            }],
+          });
+        }
       }
       continue;
     }
+
     if (event.type === 'message_delta') {
       if (event.delta?.stop_reason) finish = finishReason(event.delta.stop_reason);
       if (event.usage) {
@@ -263,8 +524,10 @@ export async function* anthropicStreamChunks(
     }
   }
 
-  if (!roleSent) yield openAiChunk(model, id, created, { role: 'assistant' });
-  yield openAiChunk(model, id, created, {}, finish ?? 'stop');
+  const roleChunk = ensureRole();
+  if (roleChunk) yield roleChunk;
+  const finalFinish = toolCalls.length ? 'tool_calls' : finish ?? 'stop';
+  yield openAiChunk(model, id, created, {}, finalFinish);
   if (includeUsage && usage) {
     yield {
       id,
