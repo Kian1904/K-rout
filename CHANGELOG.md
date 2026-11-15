@@ -2,6 +2,24 @@
 
 Notable project changes are recorded here. The notes below describe features documented in the repository; publication and release testing are tracked separately.
 
+## [Unreleased]
+
+### Added
+- Provider adapter registry: provider types are data-driven (`openai-compatible`, `gemini`, `anthropic`), so new upstreams plug in without touching routing code.
+- Native Anthropic Messages adapter with full parity: tool calling (definitions, `tool_choice`, assistant `tool_calls`, `tool` results), image content parts (base64 and http(s) URLs), streaming text and incremental tool-call deltas, and token usage mapping.
+- `GET /v1/models` for OpenAI-style model discovery.
+- `POST /admin/providers` to create providers, with duplicate-id conflict detection.
+- `POST /admin/providers/:id/test` to probe a provider connection and discover its model list from the dashboard.
+- Dashboard provider form with adapter-specific hints, create/edit flows, and a test-connection button that can auto-fill models.
+
+### Compatibility
+- Legacy `openai` provider type is accepted as `openai-compatible` across environment configuration, dashboard edits, and the stored provider registry.
+- Anthropic streaming emits OpenAI-style `data: [DONE]` termination; tool calls surface as incremental `tool_calls` deltas compatible with OpenAI clients.
+
+### Limitations
+- Gemini remains text-only; tool calls and multimodal parts are still rejected.
+- Anthropic legacy `functions`/`function_call`, `response_format`, `logprobs`, `logit_bias`, audio parts, and `n > 1` are rejected with a clear error.
+
 ## [Unreleased] — preparing v0.2.0
 
 ### Added
