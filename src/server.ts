@@ -4,18 +4,9 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import { ClientKeyStore } from './client-key-store.js';
 import { ProviderConfigStore, type StoredProvider } from './provider-config-store.js';
-import {
-  type GeminiResponse,
-  GeminiCompatibilityError,
-  geminiEndpoint,
-  readGeminiEventStream,
-  toGeminiRequest,
-  toOpenAiChunk,
-  toOpenAiResponse,
-  toOpenAiUsageChunk,
-} from './gemini-adapter.js';
+import { isAdapterType, requireAdapter, toCompatibilityError } from './adapters.js';
 
-export type ProviderType = 'openai' | 'gemini';
+export type ProviderType = 'openai-compatible' | 'gemini' | 'anthropic';
 
 export interface ProviderConfig {
   name: string;
@@ -66,15 +57,25 @@ interface ClientKeyCreateBody {
 }
 
 const DEFAULT_LOG_LIMIT = 100;
+const LEGACY_TYPE_ALIASES: Record<string, ProviderType> = { openai: 'openai-compatible' };
 
 function errorResponse(message: string, type = 'invalid_request_error') {
   return { error: { message, type } };
 }
 
+function normalizeProviderType(raw: unknown, fallback?: ProviderType): ProviderType | null {
+  if (raw === undefined || raw === null || raw === '') return fallback ?? 'openai-compatible';
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim().toLowerCase();
+  const aliased = LEGACY_TYPE_ALIASES[value];
+  if (aliased) return aliased;
+  return isAdapterType(value) ? (value as ProviderType) : null;
+}
+
 function safeProvider(provider: ProviderConfig) {
   return {
     name: provider.name,
-    type: provider.type ?? 'openai',
+    type: provider.type ?? 'openai-compatible',
     baseUrl: provider.baseUrl,
     models: [...provider.models],
     hasApiKey: Boolean(provider.apiKey),
@@ -103,24 +104,24 @@ function readProviderUpdate(body: ProviderUpdateBody, current?: ProviderConfig):
   if (models.length === 0 || !apiKey) return null;
   if (new Set(models).size !== models.length) return null;
 
-  const type = body.type ?? current?.type ?? 'openai';
-  if (type !== 'openai' && type !== 'gemini') return null;
+  const type = normalizeProviderType(body.type, current?.type);
+  if (!type) return null;
   return { name: current?.name ?? '', type, baseUrl: body.baseUrl.trim().replace(/\/+$/, ''), apiKey, models };
 }
 
 function validateProviderRegistry(input: ProviderConfig[]): ProviderConfig[] {
   const providers = input.map((provider) => ({
     ...provider,
-    type: provider.type ?? 'openai',
+    type: normalizeProviderType(provider.type) ?? 'openai-compatible',
     baseUrl: provider.baseUrl?.trim().replace(/\/+$/, ''),
-    apiKey: provider.apiKey?.trim(),
+    apiKey: String(provider.apiKey ?? ''),
     models: Array.isArray(provider.models) ? [...provider.models] : [],
   }));
   const ids = new Set<string>();
   const models = new Set<string>();
   for (const provider of providers) {
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(provider.name)
-      || (provider.type !== 'openai' && provider.type !== 'gemini')
+      || !isAdapterType(provider.type)
       || !provider.apiKey
       || provider.models.length === 0
       || provider.models.some((model) => typeof model !== 'string' || !model || model !== model.trim() || model.length > 200)) {
@@ -148,7 +149,7 @@ function validateProviderRegistry(input: ProviderConfig[]): ProviderConfig[] {
 function toStoredProvider(provider: ProviderConfig): StoredProvider {
   return {
     name: provider.name,
-    type: provider.type ?? 'openai',
+    type: provider.type ?? 'openai-compatible',
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     models: [...provider.models],
@@ -210,6 +211,16 @@ export function createApp(config: RouterConfig): FastifyInstance {
 
   app.get('/health', async () => ({ status: 'ok' }));
 
+  app.get('/v1/models', async () => ({
+    object: 'list',
+    data: models().map((entry) => ({
+      id: entry.model,
+      object: 'model',
+      created: Math.floor(startedAt / 1000),
+      owned_by: entry.provider,
+    })),
+  }));
+
   app.post<{ Body: ChatCompletionBody }>('/v1/chat/completions', async (request, reply) => {
     const authorization = request.headers.authorization ?? '';
     const clientKey = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
@@ -230,21 +241,18 @@ export function createApp(config: RouterConfig): FastifyInstance {
       return reply.code(404).send(errorResponse(`No provider is configured for model "${body.model}".`, 'model_not_found'));
     }
 
-    const providerType = provider.type ?? 'openai';
+    const adapter = requireAdapter(provider.type ?? 'openai-compatible');
+    const streaming = body.stream === true;
     let upstreamBody: string;
     let upstreamUrl: string;
+    let upstreamHeaders: Record<string, string>;
     try {
-      if (providerType === 'gemini') {
-        upstreamBody = JSON.stringify(toGeminiRequest(body));
-        upstreamUrl = geminiEndpoint(provider.baseUrl, body.model, body.stream === true);
-      } else {
-        upstreamBody = JSON.stringify(body);
-        upstreamUrl = provider.baseUrl.replace(/\/+$/, '') + '/chat/completions';
-      }
+      const built = adapter.buildRequest(provider.baseUrl, body, provider.apiKey);
+      upstreamUrl = built.url;
+      upstreamHeaders = { ...built.headers, accept: streaming ? 'text/event-stream' : 'application/json' };
+      upstreamBody = JSON.stringify(built.body);
     } catch (error) {
-      const message = error instanceof GeminiCompatibilityError
-        ? error.message
-        : 'The request could not be translated for this provider.';
+      const message = toCompatibilityError(error)?.message ?? 'The request could not be translated for this provider.';
       recordRequest({ status: 'error', provider: provider.name, model: body.model, latencyMs: Date.now() - started, httpStatus: 400 });
       return reply.code(400).send(errorResponse(message));
     }
@@ -260,13 +268,7 @@ export function createApp(config: RouterConfig): FastifyInstance {
     try {
       upstream = await fetchImpl(upstreamUrl, {
         method: 'POST',
-        headers: {
-          ...(providerType === 'gemini'
-            ? { 'x-goog-api-key': provider.apiKey }
-            : { authorization: `Bearer ${provider.apiKey}` }),
-          'content-type': 'application/json',
-          accept: body.stream === true ? 'text/event-stream' : 'application/json',
-        },
+        headers: upstreamHeaders,
         body: upstreamBody,
         signal: abortController.signal,
       });
@@ -283,17 +285,17 @@ export function createApp(config: RouterConfig): FastifyInstance {
       return reply.code(502).send(errorResponse(`The upstream provider returned HTTP ${upstream.status}.`, 'upstream_error'));
     }
 
-    if (body.stream !== true) {
-      const contentType = upstream.headers.get('content-type');
+    if (!streaming) {
       let responseBody: string | object;
-      if (providerType === 'gemini') {
+      if (adapter.normalizeResponse) {
         try {
-          responseBody = toOpenAiResponse(await upstream.json(), body.model);
+          responseBody = adapter.normalizeResponse(await upstream.json(), body.model) as string | object;
         } catch {
           recordRequest({ status: 'error', provider: provider.name, model: body.model, latencyMs: Date.now() - started, httpStatus: 502 });
           return reply.code(502).send(errorResponse('The upstream provider returned an invalid response.', 'upstream_error'));
         }
       } else {
+        const contentType = upstream.headers.get('content-type');
         if (contentType) reply.header('content-type', contentType);
         responseBody = await upstream.text();
       }
@@ -306,86 +308,55 @@ export function createApp(config: RouterConfig): FastifyInstance {
       return reply.code(502).send(errorResponse('The upstream provider returned an empty stream.', 'upstream_error'));
     }
 
-    if (providerType === 'gemini') {
-      reply.hijack();
-      reply.raw.writeHead(upstream.status, {
-        'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-cache, no-transform',
-        connection: 'keep-alive',
-        'x-accel-buffering': 'no',
-      });
-      const id = 'chatcmpl-' + randomUUID();
-      const created = Math.floor(Date.now() / 1000);
-      const includeUsage = Boolean((body.stream_options as { include_usage?: unknown } | undefined)?.include_usage);
-      let includeRole = true;
-      let lastGeminiResponse: GeminiResponse | undefined;
-      let streamFailed = false;
-      const writeEvent = async (event: unknown) => {
-        if (reply.raw.destroyed) return false;
-        if (reply.raw.write('data: ' + JSON.stringify(event) + '\n\n')) return true;
-        await new Promise<void>((resolveDrain) => {
-          const finish = () => {
-            reply.raw.off('drain', finish);
-            reply.raw.off('close', finish);
-            reply.raw.off('error', finish);
-            resolveDrain();
-          };
-          reply.raw.once('drain', finish);
-          reply.raw.once('close', finish);
-          reply.raw.once('error', finish);
-        });
-        return !reply.raw.destroyed;
-      };
-      try {
-        for await (const chunk of readGeminiEventStream(upstream.body)) {
-          lastGeminiResponse = chunk;
-          if (!await writeEvent(toOpenAiChunk(chunk, body.model, id, created, includeRole))) break;
-          includeRole = false;
-        }
-        if (includeRole) {
-          await writeEvent(toOpenAiChunk({}, body.model, id, created, true));
-          await writeEvent(toOpenAiChunk({ candidates: [{ finishReason: 'STOP' }] }, body.model, id, created, false));
-        }
-        if (includeUsage && lastGeminiResponse) {
-          const usageChunk = toOpenAiUsageChunk(lastGeminiResponse, body.model, id, created);
-          if (usageChunk) await writeEvent(usageChunk);
-        }
-        if (!reply.raw.destroyed) reply.raw.write('data: [DONE]\n\n');
-      } catch {
-        streamFailed = true;
-      } finally {
-        if (!reply.raw.destroyed) reply.raw.end();
-        recordRequest({
-          status: streamFailed ? 'error' : 'success',
-          provider: provider.name,
-          model: body.model,
-          latencyMs: Date.now() - started,
-          httpStatus: streamFailed ? 502 : upstream.status,
-        });
-      }
-      return reply;
-    }
-
     reply.hijack();
     reply.raw.writeHead(upstream.status, {
-      'content-type': upstream.headers.get('content-type') ?? 'text/event-stream; charset=utf-8',
+      'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
     });
-    const reader = upstream.body.getReader();
+    const id = 'chatcmpl-' + randomUUID();
+    const created = Math.floor(Date.now() / 1000);
     let streamFailed = false;
+    const writeEvent = async (event: unknown) => {
+      if (reply.raw.destroyed) return false;
+      if (reply.raw.write('data: ' + JSON.stringify(event) + '\n\n')) return true;
+      await new Promise<void>((resolveDrain) => {
+        const finish = () => {
+          reply.raw.off('drain', finish);
+          reply.raw.off('close', finish);
+          reply.raw.off('error', finish);
+          resolveDrain();
+        };
+        reply.raw.once('drain', finish);
+        reply.raw.once('close', finish);
+        reply.raw.once('error', finish);
+      });
+      return !reply.raw.destroyed;
+    };
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!reply.raw.write(value)) await new Promise<void>((resolveDrain) => reply.raw.once('drain', resolveDrain));
+      if (adapter.streamChunks) {
+        for await (const chunk of adapter.streamChunks(upstream.body, body.model, id, created, includeUsageFrom(body))) {
+          if (!await writeEvent(chunk)) break;
+        }
+      } else {
+        // [OI]-compatible pass-through: relay raw SSE bytes unchanged.
+        const reader = upstream.body.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!reply.raw.write(value)) await new Promise<void>((resolveDrain) => reply.raw.once('drain', resolveDrain));
+          }
+        } finally {
+          reader.releaseLock();
+        }
       }
+      if (adapter.streamChunks && !reply.raw.destroyed) reply.raw.write('data: [DONE]\n\n');
     } catch {
       streamFailed = true;
     } finally {
-      reader.releaseLock();
-      reply.raw.end();
+      if (!reply.raw.destroyed) reply.raw.end();
       recordRequest({
         status: streamFailed ? 'error' : 'success',
         provider: provider.name,
@@ -441,6 +412,35 @@ export function createApp(config: RouterConfig): FastifyInstance {
       return reply.code(204).send();
     });
 
+    admin.post<{ Body: ProviderUpdateBody & { name?: unknown } }>('/providers', async (request, reply) => {
+      const body = (request.body ?? {}) as ProviderUpdateBody & { name?: unknown };
+      if (typeof body.name !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(body.name)) {
+        return reply.code(400).send(errorResponse('A valid provider id is required.'));
+      }
+      const providerId = body.name;
+      return withProviderMutation(async () => {
+        if (providers.has(providerId)) {
+          return reply.code(409).send(errorResponse('A provider with this id already exists.', 'conflict'));
+        }
+        const created = readProviderUpdate(body);
+        if (!created) return reply.code(400).send(errorResponse('Provide a valid HTTPS base URL, provider type, API key, and model list.'));
+        created.name = providerId;
+        const next = [...providers.values()].concat(created);
+        try {
+          const validated = validateProviderRegistry(next);
+          await providerConfigStore.save(validated.map(toStoredProvider));
+          providers.clear();
+          for (const provider of validated) providers.set(provider.name, provider);
+        } catch (error) {
+          if (error instanceof Error && error.message === 'Provider model routes conflict.') {
+            return reply.code(409).send(errorResponse('Each model can be assigned to only one provider.'));
+          }
+          return reply.code(500).send(errorResponse('Provider configuration could not be saved.', 'storage_error'));
+        }
+        return reply.code(201).send({ provider: safeProvider(created) });
+      });
+    });
+
     admin.put<{ Params: { id: string }; Body: ProviderUpdateBody }>('/providers/:id', async (request, reply) => {
       const id = request.params.id;
       if (!/^[a-zA-Z0-9_-]+$/.test(id)) return reply.code(400).send(errorResponse('Invalid provider id.'));
@@ -480,6 +480,37 @@ export function createApp(config: RouterConfig): FastifyInstance {
       });
     });
 
+    admin.post<{ Params: { id: string } }>('/providers/:id/test', async (request, reply) => {
+      const id = request.params.id;
+      if (!/^[a-zA-Z0-9_-]+$/.test(id)) return reply.code(400).send(errorResponse('Invalid provider id.'));
+      const provider = providers.get(id);
+      if (!provider) return reply.code(404).send(errorResponse('Provider not found.', 'not_found'));
+      const testStarted = Date.now();
+      try {
+        const upstream = await fetchImpl(probeEndpoint(provider), {
+          method: 'GET',
+          headers: probeHeaders(provider),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const payload = await upstream.text();
+        if (!upstream.ok) {
+          return reply.code(502).send({ ok: false, httpStatus: upstream.status, error: `The provider returned HTTP ${upstream.status}.` });
+        }
+        return reply.send({
+          ok: true,
+          httpStatus: upstream.status,
+          latencyMs: Date.now() - testStarted,
+          models: parseModelList(payload),
+        });
+      } catch (error) {
+        const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+        return reply.code(502).send({
+          ok: false,
+          error: timedOut ? 'The provider did not respond within 10 seconds.' : 'The provider could not be reached.',
+        });
+      }
+    });
+
     admin.get('/models', async () => ({ models: models() }));
     admin.get('/requests', async () => ({ requests: [...requestLogs].reverse() }));
     admin.get('/settings', async () => ({
@@ -505,6 +536,43 @@ export function createApp(config: RouterConfig): FastifyInstance {
   return app;
 }
 
+function includeUsageFrom(body: ChatCompletionBody): boolean {
+  return Boolean((body.stream_options as { include_usage?: unknown } | undefined)?.include_usage);
+}
+
+function probeEndpoint(provider: ProviderConfig): string {
+  const base = provider.baseUrl.replace(/\/+$/, '');
+  if (provider.type === 'anthropic') return base.endsWith('/v1') ? `${base}/models` : `${base}/v1/models`;
+  return `${base}/models`;
+}
+
+function probeHeaders(provider: ProviderConfig): Record<string, string> {
+  switch (provider.type) {
+    case 'gemini':
+      return { 'x-goog-api-key': provider.apiKey, accept: 'application/json' };
+    case 'anthropic':
+      return { 'x-api-key': provider.apiKey, 'anthropic-version': '2023-06-01', accept: 'application/json' };
+    default:
+      return { authorization: `Bearer ${provider.apiKey}`, accept: 'application/json' };
+  }
+}
+
+function parseModelList(payload: string): string[] {
+  try {
+    const parsed = JSON.parse(payload) as { data?: Array<Record<string, unknown>>; models?: Array<Record<string, unknown>> };
+    const entries = Array.isArray(parsed.data) ? parsed.data : Array.isArray(parsed.models) ? parsed.models : [];
+    const names = entries
+      .map((entry) => {
+        const name = entry?.id ?? entry?.name;
+        return typeof name === 'string' ? name.replace(/^models\//, '') : '';
+      })
+      .filter(Boolean);
+    return [...new Set(names)].sort();
+  } catch {
+    return [];
+  }
+}
+
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -517,8 +585,8 @@ function providersFromEnv(): ProviderConfig[] {
   return ids.map((id) => {
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`Invalid provider id: ${id}`);
     const prefix = `PROVIDER_${id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
-    const configuredType = process.env[`${prefix}_TYPE`]?.trim().toLowerCase() || 'openai';
-    if (configuredType !== 'openai' && configuredType !== 'gemini') throw new Error(`${prefix}_TYPE must be "openai" or "gemini".`);
+    const configuredType = normalizeProviderType(process.env[`${prefix}_TYPE`]);
+    if (!configuredType) throw new Error(`${prefix}_TYPE must be one of: openai-compatible, gemini, anthropic.`);
     const modelList = requiredEnv(`${prefix}_MODELS`).split(',').map((model) => model.trim()).filter(Boolean);
     if (modelList.length === 0) throw new Error(`${prefix}_MODELS must contain at least one model.`);
     const baseUrl = requiredEnv(`${prefix}_BASE_URL`);

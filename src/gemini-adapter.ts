@@ -206,3 +206,32 @@ export async function* readGeminiEventStream(body: ReadableStream<Uint8Array>): 
     reader.releaseLock();
   }
 }
+
+export async function* geminiStreamChunks(
+  body: ReadableStream<Uint8Array>,
+  requestedModel: string,
+  id: string,
+  created: number,
+  includeUsage: boolean,
+): AsyncGenerator<Record<string, unknown>> {
+  let includeRole = true;
+  let last: GeminiResponse | undefined;
+
+  for await (const chunk of readGeminiEventStream(body)) {
+    last = chunk;
+    const event = toOpenAiChunk(chunk, requestedModel, id, created, includeRole);
+    if (Object.keys(event.choices[0].delta).length > 0 || event.choices[0].finish_reason !== null) {
+      yield event;
+      includeRole = false;
+    }
+  }
+
+  if (includeRole) {
+    yield toOpenAiChunk({}, requestedModel, id, created, true);
+    yield toOpenAiChunk({ candidates: [{ finishReason: 'STOP' }] }, requestedModel, id, created, false);
+  }
+  if (includeUsage && last) {
+    const usageChunk = toOpenAiUsageChunk(last, requestedModel, id, created);
+    if (usageChunk) yield usageChunk;
+  }
+}

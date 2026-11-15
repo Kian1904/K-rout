@@ -6,7 +6,8 @@ import {
 } from 'lucide-react';
 
 type Page = 'Overview' | 'Providers' | 'Models' | 'Client Keys' | 'Request Logs' | 'Settings';
-type Provider = { name: string; type: 'openai' | 'gemini'; baseUrl: string; models: string[]; hasApiKey: boolean };
+type ProviderType = 'openai-compatible' | 'gemini' | 'anthropic';
+type Provider = { name: string; type: ProviderType; baseUrl: string; models: string[]; hasApiKey: boolean };
 type Model = { model: string; provider: string };
 type ClientKey = { id: string; name: string; identifier: string; createdAt: string; revokedAt?: string };
 type RequestLog = {
@@ -30,6 +31,39 @@ const pages: Array<{ name: Page; icon: typeof LayoutDashboard }> = [
   { name: 'Request Logs', icon: Activity },
   { name: 'Settings', icon: Settings2 },
 ];
+
+const adapters: Array<{ type: ProviderType; label: string; hint: string; placeholder: string }> = [
+  {
+    type: 'openai-compatible',
+    label: '[OI]-compatible',
+    hint: 'Any provider exposing /v1/chat/completions: OpenAI, OpenRouter, Groq, Together, Ollama, LM Studio.',
+    placeholder: 'https://api.example.com/v1',
+  },
+  {
+    type: 'gemini',
+    label: 'Google Gemini API',
+    hint: 'Use the API root URL ending in /v1beta. Keys are sent in the x-goog-api-key header.',
+    placeholder: 'https://generativelanguage.googleapis.com/v1beta',
+  },
+  {
+    type: 'anthropic',
+    label: 'Anthropic Messages',
+    hint: 'Native Anthropic Messages API. Requests are translated to /v1/messages and back.',
+    placeholder: 'https://api.anthropic.com/v1',
+  },
+];
+
+function adapterFor(type: string) {
+  return adapters.find((adapter) => adapter.type === type) ?? adapters[0];
+}
+
+type ProviderTestResult = {
+  ok: boolean;
+  httpStatus?: number;
+  latencyMs?: number;
+  models?: string[];
+  error?: string;
+};
 
 async function request<T>(path: string, token: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -73,6 +107,8 @@ function App() {
   const [showProviderForm, setShowProviderForm] = useState(false);
   const [notice, setNotice] = useState('');
   const [newKey, setNewKey] = useState('');
+  const [providerTest, setProviderTest] = useState<ProviderTestResult | null>(null);
+  const [testingProvider, setTestingProvider] = useState(false);
 
   const refresh = useCallback(async (activeToken = token) => {
     if (!activeToken) return;
@@ -112,27 +148,56 @@ function App() {
   };
 
   const logout = () => {
-    setToken(''); setOverview(null); setProviders([]); setModels([]); setLogs([]); setSettings(null);
+    setToken(''); setOverview(null); setProviders([]); setModels([]); setLogs([]); setSettings(null); setClientKeys([]);
   };
 
   const saveProvider = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const id = String(form.get('name')).trim();
+    const payload = {
+      baseUrl: form.get('baseUrl'),
+      type: form.get('type'),
+      apiKey: String(form.get('apiKey') ?? ''),
+      models: String(form.get('models')).split(',').map((model) => model.trim()).filter(Boolean),
+    };
     try {
-      await request(`/admin/providers/${encodeURIComponent(id)}`, token, {
-        method: 'PUT',
-        body: JSON.stringify({
-          baseUrl: form.get('baseUrl'),
-          type: form.get('type'),
-          apiKey: form.get('apiKey'),
-          models: String(form.get('models')).split(',').map((model) => model.trim()).filter(Boolean),
-        }),
-      });
-      setShowProviderForm(false); setEditing(null); setNotice('Provider saved.');
+      if (editing) {
+        await request(`/admin/providers/${encodeURIComponent(id)}`, token, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+        setNotice('Provider saved.');
+      } else {
+        await request('/admin/providers', token, {
+          method: 'POST',
+          body: JSON.stringify({ ...payload, name: id }),
+        });
+        setNotice('Provider created.');
+      }
+      setShowProviderForm(false); setEditing(null);
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not save provider.');
+    }
+  };
+
+  const testProvider = async (id: string) => {
+    setTestingProvider(true);
+    setProviderTest(null);
+    try {
+      const result = await request<ProviderTestResult>(
+        `/admin/providers/${encodeURIComponent(id)}/test`,
+        token,
+        { method: 'POST' },
+      );
+      setProviderTest(result);
+      setNotice(result.ok ? 'Provider reachable.' : 'Provider test failed.');
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : 'Could not test provider.';
+      setProviderTest({ ok: false, error: message });
+    } finally {
+      setTestingProvider(false);
     }
   };
 
@@ -222,7 +287,7 @@ function App() {
           {error && <div role="alert" className="mb-5 flex items-center justify-between rounded-xl border border-rose-500/20 bg-rose-500/[.07] px-4 py-3 text-sm text-rose-200"><span>{error}</span><button onClick={() => setError('')}><X size={16} /></button></div>}
           {notice && <div className="toast"><Check size={16} />{notice}</div>}
           {page === 'Overview' && <OverviewPage overview={overview} providers={providers} logs={logs} successRate={successRate} setPage={setPage} />}
-          {page === 'Providers' && <ProvidersPage providers={providers} onAdd={() => { setEditing(null); setShowProviderForm(true); }} onEdit={(provider) => { setEditing(provider); setShowProviderForm(true); }} onDelete={deleteProvider} />}
+          {page === 'Providers' && <ProvidersPage providers={providers} testing={testingProvider} testResult={providerTest} onAdd={() => { setEditing(null); setProviderTest(null); setShowProviderForm(true); }} onEdit={(provider) => { setEditing(provider); setProviderTest(null); setShowProviderForm(true); }} onDelete={deleteProvider} onTest={testProvider} />}
           {page === 'Models' && <ModelsPage models={models} />}
           {page === 'Client Keys' && <ClientKeysPage clientKeys={clientKeys} newKey={newKey} onCreate={createClientKey} onCloseKey={() => setNewKey('')} onRevoke={revokeClientKey} />}
           {page === 'Request Logs' && <LogsPage logs={logs} />}
@@ -230,7 +295,7 @@ function App() {
         </main>
       </div>
 
-      {showProviderForm && <ProviderModal provider={editing} error={error} onClose={() => setShowProviderForm(false)} onSave={saveProvider} />}
+      {showProviderForm && <ProviderModal provider={editing} error={error} testing={testingProvider} testResult={providerTest} onTest={editing ? () => void testProvider(editing.name) : undefined} onClose={() => { setShowProviderForm(false); setProviderTest(null); }} onSave={saveProvider} />}
     </div>
   );
 }
@@ -272,10 +337,11 @@ function OverviewPage({ overview, providers, logs, successRate, setPage }: { ove
   </>;
 }
 
-function ProvidersPage({ providers, onAdd, onEdit, onDelete }: { providers: Provider[]; onAdd: () => void; onEdit: (provider: Provider) => void; onDelete: (provider: Provider) => void }) {
+function ProvidersPage({ providers, onAdd, onEdit, onDelete, onTest, testing, testResult }: { providers: Provider[]; onAdd: () => void; onEdit: (provider: Provider) => void; onDelete: (provider: Provider) => void; onTest: (id: string) => void; testing: boolean; testResult: ProviderTestResult | null }) {
   return <>
     <PageHeading eyebrow="UPSTREAMS" title="Providers" description="Manage upstream endpoints and model routing. Credentials are write-only and never returned." action={<button className="primary-button" onClick={onAdd}><Plus size={16} /> Add provider</button>} />
-    {providers.length ? <div className="grid gap-4 xl:grid-cols-2">{providers.map((provider, index) => <article className="panel provider-card" key={provider.name}><div className="flex items-start gap-3.5"><div className={`provider-avatar large avatar-${index % 4}`}>{provider.name.slice(0, 1).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><h2 className="truncate text-[15px] font-semibold text-slate-100">{provider.name}</h2><span className="tiny-pill">{provider.type === 'gemini' ? 'Gemini API' : 'OpenAI compatible'}</span></div><div className="mt-1.5 break-all text-xs text-slate-500">{provider.baseUrl}</div></div><div className="flex gap-1"><button className="icon-button" title="Edit provider" onClick={() => onEdit(provider)}><Settings2 size={15} /></button><button className="icon-button danger" title="Remove provider" onClick={() => onDelete(provider)}><Trash2 size={15} /></button></div></div><div className="mt-5 border-t border-white/[.055] pt-4"><div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[.15em] text-slate-600">Routed models</span><span className="text-[10px] text-slate-600">{provider.models.length} total</span></div><div className="flex flex-wrap gap-2">{provider.models.map((model) => <span className="model-chip" key={model}>{model}</span>)}</div></div><div className="mt-4 flex items-center gap-2 text-[11px] text-slate-600"><KeyRound size={13} className="text-emerald-500/70" /> API key stored server-side <span className="ml-auto text-emerald-400/70">{provider.hasApiKey ? 'Configured' : 'Missing'}</span></div></article>)}</div> : <div className="panel"><EmptyState icon={Server} title="No providers yet" detail="Connect an OpenAI-compatible provider or Gemini API to make its models available." action={<button className="primary-button" onClick={onAdd}><Plus size={16} /> Add first provider</button>} /></div>}
+    {providers.length ? <div className="grid gap-4 xl:grid-cols-2">{providers.map((provider, index) => <article className="panel provider-card" key={provider.name}><div className="flex items-start gap-3.5"><div className={`provider-avatar large avatar-${index % 4}`}>{provider.name.slice(0, 1).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><h2 className="truncate text-[15px] font-semibold text-slate-100">{provider.name}</h2><span className="tiny-pill">{adapterFor(provider.type).label}</span></div><div className="mt-1.5 break-all text-xs text-slate-500">{provider.baseUrl}</div></div><div className="flex gap-1"><button className="icon-button" title="Test provider" onClick={() => onTest(provider.name)} disabled={testing}><Activity size={15} className={testing ? 'animate-pulse' : ''} /></button><button className="icon-button" title="Edit provider" onClick={() => onEdit(provider)}><Settings2 size={15} /></button><button className="icon-button danger" title="Remove provider" onClick={() => onDelete(provider)}><Trash2 size={15} /></button></div></div><div className="mt-5 border-t border-white/[.055] pt-4"><div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[.15em] text-slate-600">Routed models</span><span className="text-[10px] text-slate-600">{provider.models.length} total</span></div><div className="flex flex-wrap gap-2">{provider.models.map((model) => <span className="model-chip" key={model}>{model}</span>)}</div></div><div className="mt-4 flex items-center gap-2 text-[11px] text-slate-600"><KeyRound size={13} className="text-emerald-500/70" /> API key stored server-side <span className="ml-auto text-emerald-400/70">{provider.hasApiKey ? 'Configured' : 'Missing'}</span></div></article>)}</div> : <div className="panel"><EmptyState icon={Server} title="No providers yet" detail="Connect an upstream provider and map models to it." action={<button className="primary-button" onClick={onAdd}><Plus size={16} /> Add first provider</button>} /></div>}
+    {testResult && <div className={`mt-5 rounded-xl border px-4 py-3 text-sm ${testResult.ok ? 'border-emerald-400/15 bg-emerald-400/[.06] text-emerald-100' : 'border-rose-400/15 bg-rose-400/[.06] text-rose-100'}`}>{testResult.ok ? <>Reachable{testResult.httpStatus ? ` · HTTP ${testResult.httpStatus}` : ''}{testResult.latencyMs != null ? ` · ${testResult.latencyMs} ms` : ''}{testResult.models?.length ? ` · ${testResult.models.length} models discovered` : ''}</> : <>Test failed: {testResult.error ?? 'unknown error'}</>}</div>}
     <div className="mt-5 flex gap-3 rounded-xl border border-amber-400/[.12] bg-amber-400/[.035] p-4 text-xs leading-5 text-amber-100/65"><CircleHelp size={16} className="mt-0.5 shrink-0 text-amber-300/70" /><span>Provider changes are saved in the local JSON config. Once it exists, that registry takes precedence over all provider environment entries.</span></div>
   </>;
 }
@@ -342,11 +408,22 @@ function SettingsPage({ settings, overview }: { settings: Settings | null; overv
   </>;
 }
 
-function ProviderModal({ provider, error, onClose, onSave }: { provider: Provider | null; error: string; onClose: () => void; onSave: (event: FormEvent<HTMLFormElement>) => void }) {
+function ProviderModal({ provider, error, onClose, onSave, onTest, testing, testResult }: { provider: Provider | null; error: string; onClose: () => void; onSave: (event: FormEvent<HTMLFormElement>) => void; onTest?: () => void; testing: boolean; testResult: ProviderTestResult | null }) {
+  const [type, setType] = useState<ProviderType>(provider?.type ?? 'openai-compatible');
+  const [modelsText, setModelsText] = useState(provider?.models.join(', ') ?? '');
+  const activeAdapter = adapterFor(type);
+
+  useEffect(() => {
+    if (testResult?.ok && testResult.models?.length && !modelsText.trim()) {
+      setModelsText(testResult.models.join(', '));
+    }
+  }, [testResult, modelsText]);
+
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="modal-card" onSubmit={onSave}><div className="flex items-start justify-between"><div><div className="eyebrow">UPSTREAM CONFIGURATION</div><h2 className="mt-2 text-lg font-semibold text-white">{provider ? 'Edit provider' : 'Add provider'}</h2><p className="mt-1 text-xs text-slate-500">API key is sent directly to your local gateway and is never shown again.</p></div><button type="button" onClick={onClose} className="icon-button"><X size={16} /></button></div>
-    <div className="mt-5 space-y-4"><label className="field-label">Provider ID<input name="name" required pattern="[A-Za-z0-9_-]+" placeholder="openai" defaultValue={provider?.name} readOnly={Boolean(provider)} className={provider ? 'readonly' : ''} /><span className="field-hint">Letters, numbers, hyphens, underscores.</span></label><label className="field-label">Provider type<select name="type" defaultValue={provider?.type ?? 'openai'}><option value="openai">OpenAI-compatible</option><option value="gemini">Google Gemini API</option></select></label><label className="field-label">API base URL<input name="baseUrl" required type="url" placeholder={provider?.type === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.example.com/v1'} defaultValue={provider?.baseUrl} /><span className="field-hint">Gemini: use the API root URL ending in /v1beta.</span></label><label className="field-label">API key<input name="apiKey" type="password" autoComplete="new-password" placeholder={provider ? 'Leave blank to keep the current key' : 'Paste provider key'} required={!provider} /></label><label className="field-label">Models<input name="models" required placeholder="model-a, model-b" defaultValue={provider?.models.join(', ')} /><span className="field-hint">Comma-separated. Each model must route to one provider only.</span></label></div>
+    <div className="mt-5 space-y-4"><label className="field-label">Provider ID<input name="name" required pattern="[A-Za-z0-9_-]+" placeholder="openai" defaultValue={provider?.name} readOnly={Boolean(provider)} className={provider ? 'readonly' : ''} /><span className="field-hint">Letters, numbers, hyphens, underscores.</span></label><label className="field-label">Provider type<select name="type" value={type} onChange={(event) => setType(event.currentTarget.value as ProviderType)}>{adapters.map((adapter) => <option key={adapter.type} value={adapter.type}>{adapter.label}</option>)}</select><span className="field-hint">{activeAdapter.hint}</span></label><label className="field-label">API base URL<input name="baseUrl" required type="url" placeholder={activeAdapter.placeholder} defaultValue={provider?.baseUrl} /><span className="field-hint">{activeAdapter.hint}</span></label><label className="field-label">API key<input name="apiKey" type="password" autoComplete="new-password" placeholder={provider ? 'Leave blank to keep the current key' : 'Paste provider key'} required={!provider} /></label><label className="field-label">Models<input name="models" required placeholder="model-a, model-b" value={modelsText} onChange={(event) => setModelsText(event.currentTarget.value)} /><span className="field-hint">Comma-separated. Each model must route to one provider only.</span></label></div>
+    {testResult && <div className={`mt-4 rounded-lg border px-3 py-2.5 text-xs ${testResult.ok ? 'border-emerald-400/15 bg-emerald-400/[.06] text-emerald-100' : 'border-rose-400/15 bg-rose-400/[.06] text-rose-100'}`}>{testResult.ok ? <>Reachable{testResult.httpStatus ? ` · HTTP ${testResult.httpStatus}` : ''}{testResult.latencyMs != null ? ` · ${testResult.latencyMs} ms` : ''}{testResult.models?.length ? ` · ${testResult.models.length} models found` : ''}</> : <>Test failed: {testResult.error ?? 'unknown error'}</>}</div>}
     {error && <div role="alert" className="mt-4 rounded-lg border border-rose-400/15 bg-rose-400/[.06] px-3 py-2.5 text-xs text-rose-200">{error}</div>}
-    <div className="mt-6 flex justify-end gap-2"><button className="secondary-button" type="button" onClick={onClose}>Cancel</button><button className="primary-button" type="submit"><Check size={15} /> Save provider</button></div>
+    <div className="mt-6 flex justify-end gap-2">{onTest && <button className="secondary-button" type="button" onClick={onTest} disabled={testing}><Activity size={15} className={testing ? 'animate-pulse' : ''} />{testing ? 'Testing…' : 'Test connection'}</button>}<button className="secondary-button" type="button" onClick={onClose}>Cancel</button><button className="primary-button" type="submit"><Check size={15} /> Save provider</button></div>
   </form></div>;
 }
 
