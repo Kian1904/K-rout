@@ -4,15 +4,16 @@ import { basename, dirname, join } from 'node:path';
 
 export type StoredProvider = {
   name: string;
-  type: 'openai' | 'gemini';
+  type: 'openai-compatible' | 'gemini' | 'anthropic';
   baseUrl: string;
   apiKey: string;
   models: string[];
 };
 
-interface ProviderConfigFile {
-  version: 1;
-  providers: StoredProvider[];
+const VALID_TYPES = new Set(['openai-compatible', 'gemini', 'anthropic', 'openai']);
+
+function normalizeStoredType(value: string): StoredProvider['type'] {
+  return value === 'openai' ? 'openai-compatible' : (value as StoredProvider['type']);
 }
 
 function validProvider(value: unknown): value is StoredProvider {
@@ -20,7 +21,7 @@ function validProvider(value: unknown): value is StoredProvider {
   const provider = value as Record<string, unknown>;
   if (Object.keys(provider).some((key) => !['name', 'type', 'baseUrl', 'apiKey', 'models'].includes(key))) return false;
   if (typeof provider.name !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(provider.name)) return false;
-  if (provider.type !== 'openai' && provider.type !== 'gemini') return false;
+  if (typeof provider.type !== 'string' || !VALID_TYPES.has(provider.type)) return false;
   if (typeof provider.baseUrl !== 'string' || typeof provider.apiKey !== 'string' || !provider.apiKey.trim()) return false;
   if (!Array.isArray(provider.models) || provider.models.length === 0) return false;
   if (!provider.models.every((model) => typeof model === 'string' && model.length > 0 && model.length <= 200 && model === model.trim())) return false;
@@ -88,7 +89,7 @@ export class ProviderConfigStore {
       throw new Error('Provider configuration file is invalid; refusing to replace it.');
     }
     await chmod(this.filePath, 0o600);
-    return record.providers.map((provider) => ({ ...provider, models: [...provider.models] }));
+    return record.providers.map((provider) => ({ ...provider, type: normalizeStoredType(provider.type), models: [...provider.models] }));
   }
 
   async save(providers: StoredProvider[]): Promise<void> {

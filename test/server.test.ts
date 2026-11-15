@@ -782,4 +782,160 @@ describe('K\'sRouter API', () => {
     assert.equal(serialized.includes('private prompt text'), false);
     assert.equal(serialized.includes('hidden response'), false);
   });
+
+  it('lists routed models on the public models endpoint', async () => {
+    const { app } = await testApp(async () => Response.json({}), { providers: [
+      { name: 'alpha', type: 'openai-compatible', baseUrl: 'https://alpha.test/v1', apiKey: 'a', models: ['model-a', 'model-b'] },
+      { name: 'beta', type: 'anthropic', baseUrl: 'https://beta.test/v1', apiKey: 'b', models: ['model-c'] },
+    ] });
+    const response = await app.inject({ method: 'GET', url: '/v1/models' });
+    assert.equal(response.statusCode, 200);
+    const body = response.json();
+    assert.equal(body.object, 'list');
+    assert.deepEqual(
+      body.data.map((entry: { id: string }) => entry.id).sort(),
+      ['model-a', 'model-b', 'model-c'],
+    );
+    assert.equal(body.data.find((entry: { id: string }) => entry.id === 'model-c').owned_by, 'beta');
+  });
+
+  it('creates a provider through the admin create endpoint and rejects duplicate ids', async () => {
+    const { app } = await testApp(async () => Response.json({}));
+    const created = await app.inject({
+      method: 'POST', url: '/admin/providers',
+      headers: adminHeaders(),
+      payload: {
+        name: 'new-provider',
+        type: 'anthropic',
+        baseUrl: 'https://anthropic.test/v1',
+        apiKey: 'anthropic-secret',
+        models: ['claude-test'],
+      },
+    });
+    assert.equal(created.statusCode, 201);
+    assert.equal(created.json().provider.type, 'anthropic');
+    assert.equal(JSON.stringify(created.json()).includes('anthropic-secret'), false);
+
+    const duplicate = await app.inject({
+      method: 'POST', url: '/admin/providers',
+      headers: adminHeaders(),
+      payload: {
+        name: 'new-provider',
+        type: 'anthropic',
+        baseUrl: 'https://anthropic.test/v1',
+        apiKey: 'anthropic-secret',
+        models: ['claude-test'],
+      },
+    });
+    assert.equal(duplicate.statusCode, 409);
+
+    const unauthorized = await app.inject({
+      method: 'POST', url: '/admin/providers',
+      payload: { name: 'sneaky', baseUrl: 'https://sneaky.test/v1', apiKey: 'x', models: ['m'] },
+    });
+    assert.equal(unauthorized.statusCode, 401);
+
+    const listed = await app.inject({ method: 'GET', url: '/admin/providers', headers: adminHeaders() });
+    assert.deepEqual(listed.json().providers.map((provider: { name: string }) => provider.name).sort(), ['default', 'new-provider']);
+  });
+
+  it('tests a provider connection and reports discovered models', async () => {
+    const { app } = await testApp(async (input) => {
+      assert.equal(String(input), 'https://provider.test/v1/models');
+      return Response.json({ data: [{ id: 'demo-model' }, { id: 'other-model' }] });
+    });
+    const response = await app.inject({ method: 'POST', url: '/admin/providers/default/test', headers: adminHeaders() });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().ok, true);
+    assert.deepEqual(response.json().models, ['demo-model', 'other-model']);
+
+    const missing = await app.inject({ method: 'POST', url: '/admin/providers/nope/test', headers: adminHeaders() });
+    assert.equal(missing.statusCode, 404);
+  });
+
+  it('routes Anthropic providers natively through the messages API', async () => {
+    let receivedUrl = '';
+    let receivedHeaders: HeadersInit | undefined;
+    let receivedBody = '';
+    const { app, clientKey } = await testApp(async (input, init) => {
+      receivedUrl = String(input);
+      receivedHeaders = init?.headers;
+      receivedBody = String(init?.body);
+      return Response.json({
+        id: 'msg_test',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-test',
+        content: [{ type: 'text', text: 'Hi from Claude' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 5, output_tokens: 7 },
+      });
+    }, { providers: [{
+      name: 'claude', type: 'anthropic', baseUrl: 'https://api.anthropic.test/v1', apiKey: 'anthropic-secret', models: ['claude-test'],
+    }] });
+
+    const response = await chat(app, clientKey, {
+      model: 'claude-test',
+      messages: [{ role: 'system', content: 'be brief' }, { role: 'user', content: 'Hello' }],
+      max_tokens: 128,
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(receivedUrl, 'https://api.anthropic.test/v1/messages');
+    const headers = new Headers(receivedHeaders);
+    assert.equal(headers.get('x-api-key'), 'anthropic-secret');
+    assert.equal(headers.get('anthropic-version'), '2023-06-01');
+    const body = JSON.parse(receivedBody);
+    assert.equal(body.system, 'be brief');
+    assert.equal(body.max_tokens, 128);
+    assert.deepEqual(body.messages, [{ role: 'user', content: 'Hello' }]);
+
+    const payload = response.json();
+    assert.equal(payload.object, 'chat.completion');
+    assert.equal(payload.choices[0].message.content, 'Hi from Claude');
+    assert.equal(payload.choices[0].finish_reason, 'stop');
+    assert.deepEqual(payload.usage, { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12 });
+  });
+
+  it('translates Anthropic SSE events into [OI] chat completion chunks', async () => {
+    const sse = [
+      'data: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":3,"output_tokens":0}}}',
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hel"}}',
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n\n');
+    const { app, clientKey } = await testApp(async () => new Response(sse, {
+      headers: { 'content-type': 'text/event-stream' },
+    }), { providers: [{
+      name: 'claude', type: 'anthropic', baseUrl: 'https://api.anthropic.test/v1', apiKey: 'anthropic-secret', models: ['claude-test'],
+    }] });
+
+    const response = await chat(app, clientKey, { model: 'claude-test', messages: [{ role: 'user', content: 'Hello' }], stream: true });
+    assert.equal(response.statusCode, 200);
+    const events = response.body.split('\n').filter((line) => line.startsWith('data: ')).map((line) => line.slice(6));
+    assert.equal(events.at(-1), '[DONE]');
+    const chunks = events.filter((event) => event !== '[DONE]').map((event) => JSON.parse(event));
+    assert.equal(chunks[0].choices[0].delta.role, 'assistant');
+    const text = chunks.map((chunk) => chunk.choices[0].delta.content ?? '').join('');
+    assert.equal(text, 'Hello');
+    const final = chunks.find((chunk) => chunk.choices[0]?.finish_reason);
+    assert.equal(final?.choices[0].finish_reason, 'length');
+    const usageChunk = chunks.find((chunk) => chunk.usage);
+    assert.equal(usageChunk, undefined, 'usage chunks are only emitted when the client asks for them');
+  });
+
+  it('rejects Anthropic requests that use unsupported features before calling the provider', async () => {
+    let calls = 0;
+    const { app, clientKey } = await testApp(async () => { calls++; return Response.json({}); }, { providers: [{
+      name: 'claude', type: 'anthropic', baseUrl: 'https://api.anthropic.test/v1', apiKey: 'anthropic-secret', models: ['claude-test'],
+    }] });
+    const response = await chat(app, clientKey, {
+      model: 'claude-test',
+      messages: [{ role: 'user', content: 'Hello' }],
+      tools: [{ type: 'function', function: { name: 'x' } }],
+    });
+    assert.equal(response.statusCode, 400);
+    assert.equal(calls, 0);
+  });
 });
